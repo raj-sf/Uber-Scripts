@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0
+// @version      3.0.1
 // @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -19,7 +19,7 @@
         MIN_FARE: 3000,            // accept if fare >= MIN_FARE
         MAX_FARE: 50000,           // and fare <= MAX_FARE
         AUTO_ACCEPT: true,         // false = alert only (behaves like V2)
-        DRY_RUN: true,             // true = highlight + log + beep, but never click Accept. Turn OFF after testing.
+        DRY_RUN: false,            // true = highlight + log + beep, but never click Accept (memory-only, does not mark trips handled).
         CITY_FILTER_ON: false,     // optional: only accept if pickup/stop city text matches
         CITY_LIST: 'Chennai',      // comma separated, case-insensitive substring match
         SCAN_MS: 250,              // scan interval
@@ -61,6 +61,7 @@
     let keepAliveNodes = null;
     let scanCount = 0;
     let handled = loadHandled();
+    let dryHandled = new Set();          // dry-run / alert-only matches: memory only, never persisted
     let acceptLog = loadLog();
     let fareColIndexCache = new WeakMap();
 
@@ -187,7 +188,7 @@
             if (fare === null) continue;
             const id = rowTripId(row);
             const key = id + '|' + fare;
-            if (handled[key]) continue;
+            if (handled[key] || dryHandled.has(key)) continue;
             if (fare < S.MIN_FARE || fare > S.MAX_FARE) continue;
             if (!cityOk(row)) continue;
             matched = { row, btn, fare, id, key };
@@ -201,7 +202,7 @@
             } else {
                 if (!unhandledMatch || unhandledMatch.key !== matched.key) {
                     unhandledMatch = matched;
-                    handled[matched.key] = Date.now(); saveHandled();
+                    dryHandled.add(matched.key);
                     addLog({ id: matched.id, fare: matched.fare, result: S.DRY_RUN ? 'DRY RUN match' : 'ALERT (manual accept)' });
                     notify(matched);
                     startBeepLoop();
@@ -467,6 +468,7 @@
             saveSettings();
             if (running && (key === 'SCAN_MS' || key === 'REFRESH_MS')) startTimers();
             if (key === 'KEEPALIVE_ON') { S.KEEPALIVE_ON ? startKeepAlive() : stopKeepAlive(); }
+            if ((key === 'DRY_RUN' && !S.DRY_RUN) || (key === 'AUTO_ACCEPT' && S.AUTO_ACCEPT)) { dryHandled.clear(); stopBeepLoop(); status('Live mode: dry-run matches are eligible again'); }
         });
         bind('ufm3-min', 'MIN_FARE'); bind('ufm3-max', 'MAX_FARE'); bind('ufm3-auto', 'AUTO_ACCEPT', 'bool');
         bind('ufm3-dry', 'DRY_RUN', 'bool'); bind('ufm3-cityon', 'CITY_FILTER_ON', 'bool'); bind('ufm3-city', 'CITY_LIST', 'text');
@@ -476,7 +478,7 @@
         document.getElementById('ufm3-toggle').onclick = () => running ? stop() : start();
         document.getElementById('ufm3-ackbtn').onclick = stopBeepLoop;
         document.getElementById('ufm3-csv').onclick = exportCsv;
-        document.getElementById('ufm3-clear').onclick = () => { handled = {}; saveHandled(); status('Handled memory cleared'); };
+        document.getElementById('ufm3-clear').onclick = () => { handled = {}; dryHandled.clear(); saveHandled(); status('Handled memory cleared'); };
     }
 
     function styles() {

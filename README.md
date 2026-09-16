@@ -12,7 +12,7 @@ Tampermonkey userscripts for the Uber Fleet Supplier Portal (Trip Management pag
 1. Tampermonkey > Create a new script > paste the file > save.
 2. Open `https://fleethub.uber.com/orgs/<org>/trip-reservation-offer`.
 3. Press **START** on the panel (a click is required so the browser allows audio).
-4. It starts in **DRY RUN** (highlights and logs, never clicks). Watch a few real requests, check the log shows the right fares, then untick DRY RUN.
+4. Optional: tick **DRY RUN** first (highlights and logs, never clicks) to watch a few requests; untick it to go live. Dry-run matches are memory-only and become eligible the moment you untick.
 5. Remove the older scripts below from Tampermonkey so they do not fight over the same buttons.
 
 Sounds: two rising tones = accepted. Continuous beep = a match needs a human (alert-only mode, dry run, or an accept that timed out); ACKNOWLEDGE stops it. No sound on tab switches.
