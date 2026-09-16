@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.2
+// @version      3.0.3
 // @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -36,6 +36,7 @@
     const LS_SETTINGS = 'ufm3.settings';
     const LS_HANDLED = 'ufm3.handled';
     const LS_LOG = 'ufm3.log';
+    const LS_DIAG = 'ufm3.diag';
 
     const SEL = {
         acceptBtn: 'button[data-testid="trip-reservation-table-action-button"]',
@@ -156,13 +157,60 @@
     function pageMessages() {
         // toasts / alerts / dialogs visible right now, for diagnostics
         const out = [];
-        document.querySelectorAll('[role="alert"], [role="status"], [data-baseweb="toast"], [role="dialog"], [data-baseweb="modal"], [aria-modal="true"], [data-baseweb="drawer"]').forEach(el => {
+        document.querySelectorAll('[role="alert"], [role="status"], [data-baseweb="toast"], [data-baseweb="snackbar"], [role="dialog"], [data-baseweb="modal"], [aria-modal="true"], [data-baseweb="drawer"], div[class*="toast" i], div[class*="snack" i]').forEach(el => {
             if (el.closest('#ufm3-panel') || el.closest('#ufm3-popup')) return;
             if (!isVisible(el)) return;
             const t = clean(el.textContent).slice(0, 160);
             if (t) out.push(t);
         });
+        // text sweep for Uber's known messages even if the container has no role
+        const body = clean(document.body.innerText || '');
+        const known = body.match(/(fetching unassigned offer failed[^.]{0,40}|please refresh|no longer available|already (?:been )?accepted|something went wrong|trip (?:was )?not available|offer (?:has )?expired)/i);
+        if (known && !out.some(x => x.toLowerCase().includes(known[0].toLowerCase()))) out.push('TEXT: ' + known[0]);
         return out;
+    }
+
+    // ---------- diagnostics recorder: what changed on the page after our click ----------
+    function visibleButtonTexts() {
+        const set = new Set();
+        document.querySelectorAll('button, [role="button"], [role="menuitem"], a').forEach(b => {
+            if (b.closest('#ufm3-panel') || b.closest('#ufm3-popup')) return;
+            if (isVisible(b)) { const t = clean(b.textContent).slice(0, 40); if (t) set.add(t); }
+        });
+        return set;
+    }
+    function diagStart(m) {
+        const btn = m.btn;
+        return {
+            time: new Date().toISOString(), id: m.id, fare: m.fare,
+            button: (btn.outerHTML || '').slice(0, 400),
+            rowCells: Array.from(m.row.querySelectorAll('td, [role="cell"], [role="gridcell"]')).map(c => clean(c.textContent).slice(0, 60)),
+            before: Array.from(visibleButtonTexts()),
+            events: []
+        };
+    }
+    function diagTick(f) {
+        if (!f.diag) return;
+        const now = visibleButtonTexts();
+        const appeared = Array.from(now).filter(t => !f.diag.beforeSet.has(t));
+        const gone = f.diag.before.filter(t => !now.has(t));
+        const msgs = pageMessages();
+        const roles = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [data-baseweb="modal"], [data-baseweb="popover"], [data-baseweb="menu"], [data-baseweb="drawer"]')).filter(isVisible).map(e => (e.getAttribute('data-baseweb') || e.getAttribute('role')) + ':' + clean(e.textContent).slice(0, 80));
+        const sig = JSON.stringify([appeared, gone, msgs, roles]);
+        if (sig !== f.diag.lastSig) { f.diag.lastSig = sig; f.diag.events.push({ t: Date.now() - f.startedAt, appeared, gone, msgs, roles, url: location.pathname }); }
+    }
+    function diagSave(f, result) {
+        if (!f.diag) return;
+        f.diag.result = result;
+        try {
+            const all = JSON.parse(localStorage.getItem(LS_DIAG) || '[]'); all.push(f.diag);
+            localStorage.setItem(LS_DIAG, JSON.stringify(all.slice(-20)));
+        } catch {}
+    }
+    function exportDiag() {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([localStorage.getItem(LS_DIAG) || '[]'], { type: 'application/json' }));
+        a.download = 'uber-grabber-diag.json'; a.click();
     }
 
     function rowTripId(row) {
@@ -184,9 +232,11 @@
     // ================================================================
     function candidateRows() {
         const out = [];
-        document.querySelectorAll(SEL.acceptBtn).forEach(btn => {
+        document.querySelectorAll(SEL.acceptBtn + ', button').forEach(btn => {
             if (!isVisible(btn)) return;
             if (btn.closest('#ufm3-panel')) return;
+            if (!/^accept$/i.test(clean(btn.textContent))) return;   // never "Assign driver" / "View"
+            if (!btn.closest('tr, [role="row"]')) return;
             const row = btn.closest('tr') || btn.closest('[role="row"]') || btn.parentElement;
             if (!row) return;
             out.push({ row, btn });
@@ -246,7 +296,8 @@
         if (acceptTimes.length >= S.MAX_ACCEPTS_PER_MIN) { status('Accept cap reached this minute, waiting…'); return; }
 
         handled[m.key] = now; saveHandled();
-        inFlight = { id: m.id, fare: m.fare, startedAt: now, row: m.row, confirmed: false };
+        inFlight = { id: m.id, fare: m.fare, startedAt: now, row: m.row, btn: m.btn, confirmed: false, retried: false };
+        inFlight.diag = diagStart(m); inFlight.diag.beforeSet = new Set(inFlight.diag.before);
         acceptTimes.push(now);
         status(`Accepting ₹${m.fare.toLocaleString('en-IN')} (${m.id})…`);
         log(`ACCEPT click ₹${m.fare} ${m.id}`);
@@ -256,6 +307,19 @@
     function checkInFlight() {
         const f = inFlight;
         const elapsed = Date.now() - f.startedAt;
+        diagTick(f);
+
+        // retry once at 1.5 s: click the innermost child of the (re-found) button, in case the first click hit a re-rendered node
+        if (!f.retried && elapsed > 1500) {
+            f.retried = true;
+            const row = findRowById(f.id);
+            const b = row ? row.querySelector(SEL.acceptBtn + ', button') : null;
+            if (b && /^accept$/i.test(clean(b.textContent))) {
+                let inner = b; while (inner.firstElementChild) inner = inner.firstElementChild;
+                log('retry click on inner element'); fireClick(inner); fireClick(b);
+                if (f.diag) f.diag.events.push({ t: elapsed, retry: true });
+            }
+        }
 
         // 1) confirm dialog that appeared AFTER our click, inside a modal only
         if (!f.confirmed && elapsed <= S.CONFIRM_WINDOW_MS) {
@@ -283,8 +347,9 @@
             finishInFlight('ACCEPTED');
             return;
         }
-        if (/no longer available|already (been )?accepted|not available|unavailable|taken|expired|something went wrong|error/i.test(f.lastMsg || '')) {
+        if (/no longer available|already (been )?accepted|not available|unavailable|taken|expired|something went wrong|please refresh|failed/i.test(f.lastMsg || '')) {
             finishInFlight('LOST: ' + f.lastMsg.slice(0, 90));
+            if (/please refresh|failed/i.test(f.lastMsg)) { refreshPhase = 0; setTimeout(() => forceRefresh(), 300); }
             return;
         }
         if (elapsed > S.CONFIRM_WINDOW_MS + 4000) {
@@ -292,8 +357,15 @@
         }
     }
 
+    function forceRefresh() {
+        const a = findByText('Announcements'); if (a) fireClick(a);
+        setTimeout(() => { const t = findByText('Trip Management'); if (t) fireClick(t); }, 700);
+        setTimeout(() => { const req = findByTextPrefix('Requests'); if (req && req.getAttribute('aria-selected') !== 'true') fireClick(req); }, 1400);
+    }
+
     function finishInFlight(result) {
         const f = inFlight; inFlight = null;
+        diagSave(f, result);
         addLog({ id: f.id, fare: f.fare, result });
         if (result === 'ACCEPTED') { playAcceptTone(); notify({ fare: f.fare, id: f.id }, 'Accepted'); }
         else if (result.startsWith('LOST')) { tone(440, 0.3, 0.3); }
@@ -488,6 +560,7 @@
             <button id="ufm3-toggle" class="b main">START</button>
             <button id="ufm3-ackbtn" class="b">ACKNOWLEDGE / STOP BEEP</button>
             <button id="ufm3-csv" class="b">EXPORT ACCEPT LOG (CSV)</button>
+            <button id="ufm3-diag" class="b">EXPORT DIAGNOSTICS (JSON)</button>
             <button id="ufm3-clear" class="b">CLEAR HANDLED MEMORY</button>
             <div id="ufm3-status" class="s">Idle</div>
             <div class="h2">Accept log</div><div id="ufm3-log" class="l"></div>`;
@@ -510,6 +583,7 @@
         document.getElementById('ufm3-toggle').onclick = () => running ? stop() : start();
         document.getElementById('ufm3-ackbtn').onclick = stopBeepLoop;
         document.getElementById('ufm3-csv').onclick = exportCsv;
+        document.getElementById('ufm3-diag').onclick = exportDiag;
         document.getElementById('ufm3-clear').onclick = () => { handled = {}; dryHandled.clear(); saveHandled(); status('Handled memory cleared'); };
     }
 
