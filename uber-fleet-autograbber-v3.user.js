@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.3
+// @version      3.0.4
 // @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -22,8 +22,8 @@
         DRY_RUN: false,            // true = highlight + log + beep, but never click Accept (memory-only, does not mark trips handled).
         CITY_FILTER_ON: false,     // optional: only accept if pickup/stop city text matches
         CITY_LIST: 'Chennai',      // comma separated, case-insensitive substring match
-        SCAN_MS: 250,              // scan interval (floor 100)
-        REFRESH_MS: 3000,          // tab toggle interval to force the list to refetch (floor 1500: faster makes React rebuild the table mid-click)
+        SCAN_MS: 10,               // scan interval (ms). 10 = ~100 DOM scans/sec; CPU heavy but allowed
+        REFRESH_MS: 150,           // tab toggle interval (ms). Warning: <1000 means many list fetches/sec; Uber may throttle ('Fetching unassigned offer failed')
         REFRESH_ON: true,          // toggle Announcements <-> Trip Management
         SOUND_ON: true,
         NOTIFY_ON: true,
@@ -48,8 +48,8 @@
     // STATE
     // ================================================================
     let S = loadSettings();
-    S.SCAN_MS = Math.max(100, Number(S.SCAN_MS) || 250);
-    S.REFRESH_MS = Math.max(1500, Number(S.REFRESH_MS) || 3000);
+    S.SCAN_MS = Math.max(10, Number(S.SCAN_MS) || 10);
+    S.REFRESH_MS = Math.max(100, Number(S.REFRESH_MS) || 150);
     let running = false;
     let worker = null;
     let pageTimer = null;
@@ -377,6 +377,7 @@
     // LIST REFRESH (tab toggle, the method that works on this portal)
     // ================================================================
     let refreshPhase = 0;
+    let lastToggle = 0;
     function findByText(text) {
         const els = document.querySelectorAll('a, button, div, span, p, li, [role="tab"]');
         for (const el of els) {
@@ -396,6 +397,8 @@
     function refreshTick() {
         if (!running || !S.REFRESH_ON) return;
         if (inFlight) return;
+        if (Date.now() - lastToggle < S.REFRESH_MS) return;
+        lastToggle = Date.now();
         if (candidateRows().length) return;            // never switch away while a trip is on screen
         if (refreshPhase === 0) {
             const a = findByText('Announcements');
@@ -551,8 +554,8 @@
             ${chk('ufm3-dry', 'DRY RUN (log only, never click)', S.DRY_RUN)}
             ${chk('ufm3-cityon', 'City filter', S.CITY_FILTER_ON)}
             <label>Cities (comma separated)<input id="ufm3-city" type="text" value="${S.CITY_LIST}"></label>
-            ${num('ufm3-scan', 'Scan every (ms)', S.SCAN_MS, 100)}
-            ${num('ufm3-refresh', 'Refresh list every (ms)', S.REFRESH_MS, 1000)}
+            ${num('ufm3-scan', 'Scan every (ms)', S.SCAN_MS, 10)}
+            ${num('ufm3-refresh', 'Refresh list every (ms)', S.REFRESH_MS, 100)}
             ${chk('ufm3-refreshon', 'Tab-toggle refresh', S.REFRESH_ON)}
             ${chk('ufm3-sound', 'Sound', S.SOUND_ON)}
             ${chk('ufm3-notify', 'Desktop notification', S.NOTIFY_ON)}
@@ -568,8 +571,8 @@
 
         const bind = (id, key, kind) => document.getElementById(id).addEventListener('change', e => {
             S[key] = kind === 'bool' ? e.target.checked : kind === 'text' ? e.target.value : Number(e.target.value);
-            if (key === 'SCAN_MS') { S.SCAN_MS = Math.max(100, S.SCAN_MS || 250); e.target.value = S.SCAN_MS; }
-            if (key === 'REFRESH_MS') { S.REFRESH_MS = Math.max(1500, S.REFRESH_MS || 3000); e.target.value = S.REFRESH_MS; }
+            if (key === 'SCAN_MS') { S.SCAN_MS = Math.max(10, S.SCAN_MS || 10); e.target.value = S.SCAN_MS; }
+            if (key === 'REFRESH_MS') { S.REFRESH_MS = Math.max(100, S.REFRESH_MS || 150); e.target.value = S.REFRESH_MS; }
             saveSettings();
             if (running && (key === 'SCAN_MS' || key === 'REFRESH_MS')) startTimers();
             if (key === 'KEEPALIVE_ON') { S.KEEPALIVE_ON ? startKeepAlive() : stopKeepAlive(); }
