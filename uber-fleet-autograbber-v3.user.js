@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.6
+// @version      3.0.7
 // @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -37,6 +37,7 @@
     const LS_HANDLED = 'ufm3.handled';
     const LS_LOG = 'ufm3.log';
     const LS_DIAG = 'ufm3.diag';
+    const LS_NET = 'ufm3.net';
 
     const SEL = {
         acceptBtn: 'button[data-testid="trip-reservation-table-action-button"]',
@@ -180,6 +181,52 @@
             const b = Array.from(t.querySelectorAll('button')).find(x => /^(close|dismiss|×|x)$/i.test(clean(x.textContent)) || /close/i.test(x.getAttribute('aria-label') || ''));
             if (b) fireClick(b);
         });
+    }
+
+    // ---------- network recorder: Uber's own API calls for offers / accept ----------
+    const NET_MATCH = /offer|reservation|trip|accept|dispatch|supplier|fleet/i;
+    function netSave(entry) {
+        try {
+            const all = JSON.parse(localStorage.getItem(LS_NET) || '[]'); all.push(entry);
+            localStorage.setItem(LS_NET, JSON.stringify(all.slice(-80)));
+        } catch {}
+        if (inFlight && inFlight.diag) inFlight.diag.events.push({ t: Date.now() - inFlight.startedAt, net: entry });
+    }
+    function installNetRecorder() {
+        if (window.__ufm3NetInstalled) return; window.__ufm3NetInstalled = true;
+        const origFetch = window.fetch;
+        window.fetch = async function (input, init) {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            const method = (init && init.method) || (input && input.method) || 'GET';
+            const started = Date.now();
+            let body = null; try { body = init && typeof init.body === 'string' ? init.body.slice(0, 600) : null; } catch {}
+            const res = await origFetch.apply(this, arguments);
+            if (NET_MATCH.test(url) && !/\.(js|css|png|svg|woff2?)(\?|$)/i.test(url)) {
+                let text = null;
+                try { text = (await res.clone().text()).slice(0, 800); } catch {}
+                netSave({ time: new Date().toISOString(), via: 'fetch', method, url: url.slice(0, 300), status: res.status, ms: Date.now() - started, reqBody: body, resBody: text });
+            }
+            return res;
+        };
+        const origOpen = XMLHttpRequest.prototype.open, origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u) { this.__ufm = { method: m, url: String(u), started: 0 }; return origOpen.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function (b) {
+            const meta = this.__ufm;
+            if (meta && NET_MATCH.test(meta.url)) {
+                meta.started = Date.now(); meta.reqBody = typeof b === 'string' ? b.slice(0, 600) : null;
+                this.addEventListener('loadend', () => {
+                    let text = null; try { text = String(this.responseText || '').slice(0, 800); } catch {}
+                    netSave({ time: new Date().toISOString(), via: 'xhr', method: meta.method, url: meta.url.slice(0, 300), status: this.status, ms: Date.now() - meta.started, reqBody: meta.reqBody, resBody: text });
+                });
+            }
+            return origSend.apply(this, arguments);
+        };
+        log('network recorder installed');
+    }
+    function exportNet() {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([localStorage.getItem(LS_NET) || '[]'], { type: 'application/json' }));
+        a.download = 'uber-grabber-net.json'; a.click();
     }
 
     // ---------- diagnostics recorder: what changed on the page after our click ----------
@@ -371,7 +418,12 @@
             if (/please refresh|failed/i.test(f.lastMsg)) {
                 refreshPhase = 0; setTimeout(() => forceRefresh(), 300);
                 const key = f.id + '|' + f.fare;
-                if (!retryOnce[key]) { retryOnce[key] = true; setTimeout(() => { delete handled[key]; saveHandled(); log('re-armed ' + key + ' for one retry after refresh'); }, 2500); }
+                if (!retryOnce[key]) { retryOnce[key] = true; setTimeout(() => {
+                    delete handled[key]; saveHandled();
+                    const present = !!findRowById(f.id);
+                    log('re-armed ' + key + ' after refresh; row present=' + present);
+                    addLog({ id: f.id, fare: f.fare, result: present ? 'RETRY armed (row still listed)' : 'GONE after refresh (taken by someone else)' });
+                }, 2500); }
             }
             return;
         }
@@ -588,6 +640,7 @@
             <button id="ufm3-ackbtn" class="b">ACKNOWLEDGE / STOP BEEP</button>
             <button id="ufm3-csv" class="b">EXPORT ACCEPT LOG (CSV)</button>
             <button id="ufm3-diag" class="b">EXPORT DIAGNOSTICS (JSON)</button>
+            <button id="ufm3-net" class="b">EXPORT NETWORK LOG (JSON)</button>
             <button id="ufm3-clear" class="b">CLEAR HANDLED MEMORY</button>
             <div id="ufm3-status" class="s">Idle</div>
             <div class="h2">Accept log</div><div id="ufm3-log" class="l"></div>`;
@@ -611,6 +664,7 @@
         document.getElementById('ufm3-ackbtn').onclick = stopBeepLoop;
         document.getElementById('ufm3-csv').onclick = exportCsv;
         document.getElementById('ufm3-diag').onclick = exportDiag;
+        document.getElementById('ufm3-net').onclick = exportNet;
         document.getElementById('ufm3-clear').onclick = () => { handled = {}; dryHandled.clear(); saveHandled(); status('Handled memory cleared'); };
     }
 
@@ -654,5 +708,6 @@
         status('Stopped'); log('stopped');
     }
 
+    installNetRecorder();
     setTimeout(() => { panel(); log('panel ready. Press START (a click is needed so the browser allows sound).'); }, 1500);
 })();
