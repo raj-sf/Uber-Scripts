@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.5
+// @version      3.0.6
 // @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -165,11 +165,21 @@
             const t = clean(el.textContent).slice(0, 160);
             if (t) out.push(t);
         });
-        // text sweep for Uber's known messages even if the container has no role
-        const body = clean(document.body.innerText || '');
-        const known = body.match(/(fetching unassigned offer failed[^.]{0,40}|please refresh|no longer available|already (?:been )?accepted|something went wrong|trip (?:was )?not available|offer (?:has )?expired)/i);
+        // text sweep for Uber's known messages even if the container has no role. NEVER read our own panel/popup.
+        const body = clean(Array.from(document.body.children)
+            .filter(el => el.id !== 'ufm3-panel' && el.id !== 'ufm3-popup' && el.tagName !== 'SCRIPT' && el.tagName !== 'STYLE')
+            .map(el => el.innerText || '').join(' '));
+        const known = body.match(/(fetching unassigned offer failed[^.]{0,40}|trip acceptance failed[^.]{0,40}|please refresh|no longer available|already (?:been )?accepted|something went wrong|trip (?:was )?not available|offer (?:has )?expired)/i);
         if (known && !out.some(x => x.toLowerCase().includes(known[0].toLowerCase()))) out.push('TEXT: ' + known[0]);
         return out;
+    }
+
+    function closeToasts() {
+        document.querySelectorAll('[role="alert"], [data-baseweb="toast"], div[class*="toast" i]').forEach(t => {
+            if (t.closest('#ufm3-panel') || !isVisible(t)) return;
+            const b = Array.from(t.querySelectorAll('button')).find(x => /^(close|dismiss|×|x)$/i.test(clean(x.textContent)) || /close/i.test(x.getAttribute('aria-label') || ''));
+            if (b) fireClick(b);
+        });
     }
 
     // ---------- diagnostics recorder: what changed on the page after our click ----------
@@ -302,7 +312,7 @@
         if (acceptTimes.length >= S.MAX_ACCEPTS_PER_MIN) { status('Accept cap reached this minute, waiting…'); return; }
 
         handled[m.key] = now; saveHandled();
-        inFlight = { id: m.id, fare: m.fare, startedAt: now, row: m.row, btn: m.btn, confirmed: false, retried: false };
+        inFlight = { id: m.id, fare: m.fare, startedAt: now, row: m.row, btn: m.btn, confirmed: false, retried: false, baseline: new Set(pageMessages()), lastCheck: 0 };
         inFlight.diag = diagStart(m); inFlight.diag.beforeSet = new Set(inFlight.diag.before);
         acceptTimes.push(now);
         status(`Accepting ₹${m.fare.toLocaleString('en-IN')} (${m.id})…`);
@@ -313,6 +323,8 @@
     function checkInFlight() {
         const f = inFlight;
         const elapsed = Date.now() - f.startedAt;
+        if (Date.now() - f.lastCheck < 100) return;
+        f.lastCheck = Date.now();
         diagTick(f);
 
         // retry once at 1.5 s: click the innermost child of the (re-found) button, in case the first click hit a re-rendered node
@@ -347,7 +359,7 @@
 
         // 2) judge by re-finding the row by trip id (React re-renders replace the nodes)
         const liveRow = findRowById(f.id);
-        const msgs = pageMessages();
+        const msgs = pageMessages().filter(x => !f.baseline.has(x));   // only messages that appeared AFTER our click
         if (msgs.length) f.lastMsg = msgs.join(' | ');
         if (!liveRow && elapsed > 800) {
             finishInFlight('ACCEPTED');
@@ -355,6 +367,7 @@
         }
         if (/no longer available|already (been )?accepted|not available|unavailable|taken|expired|something went wrong|please refresh|failed/i.test(f.lastMsg || '')) {
             finishInFlight('LOST: ' + f.lastMsg.slice(0, 90));
+            setTimeout(closeToasts, 200);
             if (/please refresh|failed/i.test(f.lastMsg)) {
                 refreshPhase = 0; setTimeout(() => forceRefresh(), 300);
                 const key = f.id + '|' + f.fare;
