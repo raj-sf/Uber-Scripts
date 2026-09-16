@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.4
+// @version      3.0.5
 // @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -66,6 +66,7 @@
     let handled = loadHandled();
     let dryHandled = new Set();          // dry-run / alert-only matches: memory only, never persisted
     let acceptLog = loadLog();
+    let retryOnce = {};                  // key -> true once we have re-armed it after a 'please refresh' rejection
     let fareColIndexCache = new WeakMap();
 
     // ================================================================
@@ -130,7 +131,8 @@
     }
 
     function rowFare(row) {
-        const cells = row.querySelectorAll('td, [role="cell"], [role="gridcell"]');
+        let cells = row.querySelectorAll(':scope > td, :scope > th, :scope > [role="cell"], :scope > [role="gridcell"]');
+        if (!cells.length) cells = row.querySelectorAll('td, [role="cell"], [role="gridcell"]');
         const table = row.closest('table');
         const idx = fareColumnIndex(table);
         if (idx >= 0 && cells[idx]) {
@@ -184,7 +186,7 @@
         return {
             time: new Date().toISOString(), id: m.id, fare: m.fare,
             button: (btn.outerHTML || '').slice(0, 400),
-            rowCells: Array.from(m.row.querySelectorAll('td, [role="cell"], [role="gridcell"]')).map(c => clean(c.textContent).slice(0, 60)),
+            rowCells: Array.from(m.row.querySelectorAll(':scope > td, :scope > [role="cell"], :scope > [role="gridcell"]')).map(c => clean(c.textContent).slice(0, 60)),
             before: Array.from(visibleButtonTexts()),
             events: []
         };
@@ -247,16 +249,11 @@
     // ================================================================
     // SCAN
     // ================================================================
-    function scan() {
-        if (!running) return;
-        scanCount++;
-        if (inFlight) { checkInFlight(); return; }
-
+    let lastSeen = 0;
+    function findMatch() {
         const cands = candidateRows();
-        let seen = 0, matched = null;
-
+        lastSeen = cands.length;
         for (const { row, btn } of cands) {
-            seen++;
             const fare = rowFare(row);
             if (fare === null) continue;
             const id = rowTripId(row);
@@ -264,9 +261,18 @@
             if (handled[key] || dryHandled.has(key)) continue;
             if (fare < S.MIN_FARE || fare > S.MAX_FARE) continue;
             if (!cityOk(row)) continue;
-            matched = { row, btn, fare, id, key };
-            break; // one at a time
+            return { row, btn, fare, id, key };
         }
+        return null;
+    }
+
+    function scan() {
+        if (!running) return;
+        scanCount++;
+        if (inFlight) { checkInFlight(); return; }
+
+        const matched = findMatch();
+        const seen = lastSeen;
 
         if (matched) {
             highlight(matched.row);
@@ -283,7 +289,7 @@
                 }
             }
         } else {
-            status(`Scanning… rows: ${seen}, range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' (DRY RUN)' : ''}`);
+            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}<br>scans: ${scanCount} · refreshes: ${refreshCount} · last refresh: ${lastToggle ? Math.round((Date.now() - lastToggle) / 1000) + 's ago' : 'never'}`);
         }
     }
 
@@ -349,7 +355,11 @@
         }
         if (/no longer available|already (been )?accepted|not available|unavailable|taken|expired|something went wrong|please refresh|failed/i.test(f.lastMsg || '')) {
             finishInFlight('LOST: ' + f.lastMsg.slice(0, 90));
-            if (/please refresh|failed/i.test(f.lastMsg)) { refreshPhase = 0; setTimeout(() => forceRefresh(), 300); }
+            if (/please refresh|failed/i.test(f.lastMsg)) {
+                refreshPhase = 0; setTimeout(() => forceRefresh(), 300);
+                const key = f.id + '|' + f.fare;
+                if (!retryOnce[key]) { retryOnce[key] = true; setTimeout(() => { delete handled[key]; saveHandled(); log('re-armed ' + key + ' for one retry after refresh'); }, 2500); }
+            }
             return;
         }
         if (elapsed > S.CONFIRM_WINDOW_MS + 4000) {
@@ -378,6 +388,7 @@
     // ================================================================
     let refreshPhase = 0;
     let lastToggle = 0;
+    let refreshCount = 0;
     function findByText(text) {
         const els = document.querySelectorAll('a, button, div, span, p, li, [role="tab"]');
         for (const el of els) {
@@ -399,10 +410,10 @@
         if (inFlight) return;
         if (Date.now() - lastToggle < S.REFRESH_MS) return;
         lastToggle = Date.now();
-        if (candidateRows().length) return;            // never switch away while a trip is on screen
+        if (findMatch()) return;                        // hold only while a MATCHING trip is on screen
         if (refreshPhase === 0) {
             const a = findByText('Announcements');
-            if (a) { fireClick(a); refreshPhase = 1; }
+            if (a) { fireClick(a); refreshPhase = 1; refreshCount++; }
         } else {
             const t = findByText('Trip Management');
             if (t) fireClick(t);
