@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.0.2
 // @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -22,8 +22,8 @@
         DRY_RUN: false,            // true = highlight + log + beep, but never click Accept (memory-only, does not mark trips handled).
         CITY_FILTER_ON: false,     // optional: only accept if pickup/stop city text matches
         CITY_LIST: 'Chennai',      // comma separated, case-insensitive substring match
-        SCAN_MS: 250,              // scan interval
-        REFRESH_MS: 3000,          // tab toggle interval to force the list to refetch
+        SCAN_MS: 250,              // scan interval (floor 100)
+        REFRESH_MS: 3000,          // tab toggle interval to force the list to refetch (floor 1500: faster makes React rebuild the table mid-click)
         REFRESH_ON: true,          // toggle Announcements <-> Trip Management
         SOUND_ON: true,
         NOTIFY_ON: true,
@@ -39,7 +39,7 @@
 
     const SEL = {
         acceptBtn: 'button[data-testid="trip-reservation-table-action-button"]',
-        dialog: '[role="dialog"], [data-baseweb="modal"], [aria-modal="true"]',
+        dialog: '[role="dialog"], [role="alertdialog"], [data-baseweb="modal"], [aria-modal="true"], [data-baseweb="drawer"]',
         baseButton: 'button[data-baseweb="button"], button'
     };
 
@@ -47,6 +47,8 @@
     // STATE
     // ================================================================
     let S = loadSettings();
+    S.SCAN_MS = Math.max(100, Number(S.SCAN_MS) || 250);
+    S.REFRESH_MS = Math.max(1500, Number(S.REFRESH_MS) || 3000);
     let running = false;
     let worker = null;
     let pageTimer = null;
@@ -140,6 +142,27 @@
             if (v !== null) return v;
         }
         return null;
+    }
+
+    function findRowById(id) {
+        const btns = document.querySelectorAll(SEL.acceptBtn);
+        for (const b of btns) {
+            const row = b.closest('tr') || b.closest('[role="row"]') || b.parentElement;
+            if (row && rowTripId(row) === id) return row;
+        }
+        return null;
+    }
+
+    function pageMessages() {
+        // toasts / alerts / dialogs visible right now, for diagnostics
+        const out = [];
+        document.querySelectorAll('[role="alert"], [role="status"], [data-baseweb="toast"], [role="dialog"], [data-baseweb="modal"], [aria-modal="true"], [data-baseweb="drawer"]').forEach(el => {
+            if (el.closest('#ufm3-panel') || el.closest('#ufm3-popup')) return;
+            if (!isVisible(el)) return;
+            const t = clean(el.textContent).slice(0, 160);
+            if (t) out.push(t);
+        });
+        return out;
     }
 
     function rowTripId(row) {
@@ -242,7 +265,7 @@
                 const btns = d.querySelectorAll(SEL.baseButton);
                 for (const b of btns) {
                     const t = clean(b.textContent).toLowerCase();
-                    if (isVisible(b) && /^(confirm|submit|apply|yes|accept|ok)$/.test(t)) {
+                    if (isVisible(b) && /^(confirm|submit|apply|yes|accept|ok|accept trip|yes, accept|confirm accept)$/.test(t)) {
                         f.confirmed = true;
                         log('CONFIRM click');
                         fireClick(b);
@@ -252,14 +275,20 @@
             }
         }
 
-        // 2) success = the row's Accept button is gone (row removed or state changed)
-        const stillThere = document.contains(f.row) && f.row.querySelector(SEL.acceptBtn) && isVisible(f.row.querySelector(SEL.acceptBtn));
-        if (!stillThere && elapsed > 800) {
+        // 2) judge by re-finding the row by trip id (React re-renders replace the nodes)
+        const liveRow = findRowById(f.id);
+        const msgs = pageMessages();
+        if (msgs.length) f.lastMsg = msgs.join(' | ');
+        if (!liveRow && elapsed > 800) {
             finishInFlight('ACCEPTED');
             return;
         }
+        if (/no longer available|already (been )?accepted|not available|unavailable|taken|expired|something went wrong|error/i.test(f.lastMsg || '')) {
+            finishInFlight('LOST: ' + f.lastMsg.slice(0, 90));
+            return;
+        }
         if (elapsed > S.CONFIRM_WINDOW_MS + 4000) {
-            finishInFlight('TIMEOUT (button still present)');
+            finishInFlight('TIMEOUT' + (f.confirmed ? ' after confirm' : ' no confirm dialog seen') + (f.lastMsg ? ': ' + f.lastMsg.slice(0, 90) : ''));
         }
     }
 
@@ -267,6 +296,7 @@
         const f = inFlight; inFlight = null;
         addLog({ id: f.id, fare: f.fare, result });
         if (result === 'ACCEPTED') { playAcceptTone(); notify({ fare: f.fare, id: f.id }, 'Accepted'); }
+        else if (result.startsWith('LOST')) { tone(440, 0.3, 0.3); }
         else { startBeepLoop(); unhandledMatch = { key: f.id, fare: f.fare, id: f.id }; }
         status(`${result}: ₹${f.fare.toLocaleString('en-IN')} (${f.id})`);
     }
@@ -465,6 +495,8 @@
 
         const bind = (id, key, kind) => document.getElementById(id).addEventListener('change', e => {
             S[key] = kind === 'bool' ? e.target.checked : kind === 'text' ? e.target.value : Number(e.target.value);
+            if (key === 'SCAN_MS') { S.SCAN_MS = Math.max(100, S.SCAN_MS || 250); e.target.value = S.SCAN_MS; }
+            if (key === 'REFRESH_MS') { S.REFRESH_MS = Math.max(1500, S.REFRESH_MS || 3000); e.target.value = S.REFRESH_MS; }
             saveSettings();
             if (running && (key === 'SCAN_MS' || key === 'REFRESH_MS')) startTimers();
             if (key === 'KEEPALIVE_ON') { S.KEEPALIVE_ON ? startKeepAlive() : stopKeepAlive(); }
