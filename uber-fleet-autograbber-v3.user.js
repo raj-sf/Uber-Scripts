@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.7
-// @description  Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
+// @version      3.1.0
+// @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
 // @run-at       document-end
@@ -22,6 +22,10 @@
         DRY_RUN: false,            // true = highlight + log + beep, but never click Accept (memory-only, does not mark trips handled).
         CITY_FILTER_ON: false,     // optional: only accept if pickup/stop city text matches
         CITY_LIST: 'Chennai',      // comma separated, case-insensitive substring match
+        PICKUP_FILTER_ON: false,   // only accept if pickup date is inside the window below (IST)
+        PICKUP_FROM: '',           // 'YYYY-MM-DD' (IST) or blank = no lower limit
+        PICKUP_TO: '',             // 'YYYY-MM-DD' (IST) or blank = no upper limit
+        SKIP_TODAY: false,         // quick switch: never accept pickups dated today (IST)
         SCAN_MS: 10,               // scan interval (ms). 10 = ~100 DOM scans/sec; CPU heavy but allowed
         REFRESH_MS: 150,           // tab toggle interval (ms). Warning: <1000 means many list fetches/sec; Uber may throttle ('Fetching unassigned offer failed')
         REFRESH_ON: true,          // toggle Announcements <-> Trip Management
@@ -272,6 +276,49 @@
         a.download = 'uber-grabber-diag.json'; a.click();
     }
 
+    // ---------- pickup time (IST) ----------
+    const MONTHS = { january:0, february:1, march:2, april:3, may:4, june:5, july:6, august:7, september:8, october:9, november:10, december:11 };
+    function parsePickup(text) {
+        // "Thursday, September 17, 2026, 7:00:00 AM GMT+5:30"  -> epoch ms
+        const m = clean(text).match(/([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4}),?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?(?:\s*GMT([+-]\d{1,2}):?(\d{2})?)?/i);
+        if (!m) return null;
+        const mon = MONTHS[m[1].toLowerCase()]; if (mon === undefined) return null;
+        let h = Number(m[4]); const mi = Number(m[5]), sec = Number(m[6] || 0);
+        if (m[7]) { const pm = m[7].toUpperCase() === 'PM'; if (pm && h < 12) h += 12; if (!pm && h === 12) h = 0; }
+        const offMin = m[8] !== undefined ? (Number(m[8]) * 60 + (Number(m[8]) < 0 ? -1 : 1) * Number(m[9] || 0)) : 330;
+        return Date.UTC(Number(m[3]), mon, Number(m[2]), h, mi, sec) - offMin * 60000;
+    }
+    function istDateString(ms) {          // YYYY-MM-DD in IST
+        const d = new Date(ms + 330 * 60000);
+        return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+    }
+    function pickupColumnIndex(table) {
+        if (!table) return -1;
+        const cells = table.querySelectorAll('thead th, thead td, tr:first-child th');
+        let idx = -1; cells.forEach((c, i) => { if (idx < 0 && /pickup\s*time/i.test(clean(c.textContent))) idx = i; });
+        return idx;
+    }
+    function rowPickup(row) {
+        let cells = row.querySelectorAll(':scope > td, :scope > th, :scope > [role="cell"], :scope > [role="gridcell"]');
+        if (!cells.length) cells = row.querySelectorAll('td, [role="cell"], [role="gridcell"]');
+        const idx = pickupColumnIndex(row.closest('table'));
+        if (idx >= 0 && cells[idx]) { const v = parsePickup(cells[idx].textContent); if (v !== null) return v; }
+        for (const c of cells) { const v = parsePickup(c.textContent); if (v !== null) return v; }   // first date-looking cell = pickup (submitted time comes later)
+        return null;
+    }
+    function pickupOk(row) {
+        if (!S.PICKUP_FILTER_ON && !S.SKIP_TODAY) return true;
+        const ms = rowPickup(row);
+        if (ms === null) return true;                     // cannot read it: do not block on this filter
+        const day = istDateString(ms);
+        if (S.SKIP_TODAY && day === istDateString(Date.now())) return false;
+        if (S.PICKUP_FILTER_ON) {
+            if (S.PICKUP_FROM && day < S.PICKUP_FROM) return false;
+            if (S.PICKUP_TO && day > S.PICKUP_TO) return false;
+        }
+        return true;
+    }
+
     function rowTripId(row) {
         const first = row.querySelector('td, [role="cell"], [role="gridcell"]');
         const id = clean(first ? first.textContent : '');
@@ -318,6 +365,7 @@
             if (handled[key] || dryHandled.has(key)) continue;
             if (fare < S.MIN_FARE || fare > S.MAX_FARE) continue;
             if (!cityOk(row)) continue;
+            if (!pickupOk(row)) continue;
             return { row, btn, fare, id, key };
         }
         return null;
@@ -346,7 +394,7 @@
                 }
             }
         } else {
-            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}<br>scans: ${scanCount} · refreshes: ${refreshCount} · last refresh: ${lastToggle ? Math.round((Date.now() - lastToggle) / 1000) + 's ago' : 'never'}`);
+            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>scans: ${scanCount} · refreshes: ${refreshCount} · last refresh: ${lastToggle ? Math.round((Date.now() - lastToggle) / 1000) + 's ago' : 'never'}`);
         }
     }
 
@@ -630,6 +678,10 @@
             ${chk('ufm3-dry', 'DRY RUN (log only, never click)', S.DRY_RUN)}
             ${chk('ufm3-cityon', 'City filter', S.CITY_FILTER_ON)}
             <label>Cities (comma separated)<input id="ufm3-city" type="text" value="${S.CITY_LIST}"></label>
+            ${chk('ufm3-skiptoday', 'Skip today\'s pickups (IST)', S.SKIP_TODAY)}
+            ${chk('ufm3-pickupon', 'Pickup date window (IST)', S.PICKUP_FILTER_ON)}
+            <label>Pickup from<input id="ufm3-pfrom" type="date" value="${S.PICKUP_FROM}"></label>
+            <label>Pickup to<input id="ufm3-pto" type="date" value="${S.PICKUP_TO}"></label>
             ${num('ufm3-scan', 'Scan every (ms)', S.SCAN_MS, 10)}
             ${num('ufm3-refresh', 'Refresh list every (ms)', S.REFRESH_MS, 100)}
             ${chk('ufm3-refreshon', 'Tab-toggle refresh', S.REFRESH_ON)}
@@ -657,6 +709,7 @@
         });
         bind('ufm3-min', 'MIN_FARE'); bind('ufm3-max', 'MAX_FARE'); bind('ufm3-auto', 'AUTO_ACCEPT', 'bool');
         bind('ufm3-dry', 'DRY_RUN', 'bool'); bind('ufm3-cityon', 'CITY_FILTER_ON', 'bool'); bind('ufm3-city', 'CITY_LIST', 'text');
+        bind('ufm3-skiptoday', 'SKIP_TODAY', 'bool'); bind('ufm3-pickupon', 'PICKUP_FILTER_ON', 'bool'); bind('ufm3-pfrom', 'PICKUP_FROM', 'text'); bind('ufm3-pto', 'PICKUP_TO', 'text');
         bind('ufm3-scan', 'SCAN_MS'); bind('ufm3-refresh', 'REFRESH_MS'); bind('ufm3-refreshon', 'REFRESH_ON', 'bool');
         bind('ufm3-sound', 'SOUND_ON', 'bool'); bind('ufm3-notify', 'NOTIFY_ON', 'bool'); bind('ufm3-keep', 'KEEPALIVE_ON', 'bool');
 
@@ -675,7 +728,7 @@
         #ufm3-panel .h{font-size:16px;font-weight:700;margin-bottom:8px}#ufm3-panel .h span{float:right;font-size:11px;opacity:.6}
         #ufm3-panel .h2{font-weight:700;margin-top:10px}
         #ufm3-panel label{display:block;margin:6px 0}#ufm3-panel label.c{display:flex;gap:6px;align-items:center}
-        #ufm3-panel input[type=number],#ufm3-panel input[type=text]{width:100%;box-sizing:border-box;padding:6px;border-radius:6px;border:1px solid #555;background:#222;color:#fff;margin-top:3px}
+        #ufm3-panel input[type=number],#ufm3-panel input[type=text],#ufm3-panel input[type=date]{width:100%;box-sizing:border-box;padding:6px;border-radius:6px;border:1px solid #555;background:#222;color:#fff;margin-top:3px}
         #ufm3-panel .b{width:100%;padding:9px;margin-top:6px;border:0;border-radius:7px;cursor:pointer;font-weight:700;background:#333;color:#fff}
         #ufm3-panel .b.main{background:#2e7d32}#ufm3-panel .b.main.on{background:#c62828}
         #ufm3-panel .run{padding:6px;border-radius:6px;text-align:center;font-weight:700;margin-bottom:6px;background:#444}

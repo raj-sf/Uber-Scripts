@@ -6,7 +6,7 @@ Tampermonkey userscripts for the Uber Fleet Supplier Portal (Trip Management pag
 
 | File | What it does |
 |---|---|
-| `uber-fleet-autograbber-v3.user.js` | **Use this one.** Scans Trip Management, reads the Fare column exactly, auto-accepts trips inside the configured fare range, confirms only the dialog it opened, keeps the request list fresh by toggling Announcements/Trip Management, keeps running in a background tab (Web Worker timer + inaudible keep-alive tone), logs every accept (CSV export). Panel with min/max fare, optional city filter, intervals, sound, dry run. |
+| `uber-fleet-autograbber-v3.user.js` | **Use this one.** Scans Trip Management, reads the Fare column exactly, filters by pickup date (skip today, or a from/to window, IST), auto-accepts trips inside the configured fare range, confirms only the dialog it opened, keeps the request list fresh by toggling Announcements/Trip Management, keeps running in a background tab (Web Worker timer + inaudible keep-alive tone), logs every accept (CSV export). Panel with min/max fare, optional city filter, intervals, sound, dry run. |
 
 ### Install
 1. Tampermonkey > Create a new script > paste the file > save.
