@@ -21,7 +21,7 @@
         AUTO_ACCEPT: true,         // false = alert only (behaves like V2)
         DRY_RUN: false,            // true = highlight + log + beep, but never click Accept (memory-only, does not mark trips handled).
         CITY_FILTER_ON: false,     // optional: only accept if pickup/stop city text matches
-        CITY_LIST: 'Tamil Nadu',      // comma separated, case-insensitive substring match
+        CITY_LIST: 'Chennai,Tamil Nadu',      // comma separated, case-insensitive substring match
         PICKUP_FILTER_ON: false,   // only accept if pickup date is inside the window below (IST)
         PICKUP_FROM: '',           // 'YYYY-MM-DD' (IST) or blank = no lower limit
         PICKUP_TO: '',             // 'YYYY-MM-DD' (IST) or blank = no upper limit
