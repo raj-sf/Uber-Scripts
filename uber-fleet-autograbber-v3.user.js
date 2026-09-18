@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.5.1
+// @version      3.5.2
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -30,10 +30,11 @@
         POST_REFRESH_MS: 800,      // after a tab toggle, wait this long before clicking anything
         DIRECT_MODE: true,         // talk to Uber's GraphQL API directly instead of clicking DOM buttons (much faster, no stale rows)
         DIRECT_POLL_MS: 400,       // how often to poll the offers queries in direct mode
-        // Which offer lists to poll, best first. AcceptOpenTripOffer accepts OPEN offers;
-        // Unassigned is the other list that carries acceptable requests. Do NOT add
-        // Assigned/InProgress/Completed here - those are trips already taken.
-        DIRECT_SOURCES: 'GetOpenTripReservationOffers,GetUnassignedTripReservationOffers',
+        // Which offer lists to poll. ONLY Open holds acceptable offers.
+        // Measured live 2026-09-18: 11 of 12 accepts sourced from Unassigned came back
+        // "Offer is already accepted" - that list is trips the fleet ALREADY has, waiting on
+        // a driver. Polling it just spams Uber with pointless accepts. Open only.
+        DIRECT_SOURCES: 'GetOpenTripReservationOffers',
         SCAN_MS: 10,               // scan interval (ms). 10 = ~100 DOM scans/sec; CPU heavy but allowed
         REFRESH_MS: 150,           // tab toggle interval (ms). Warning: <1000 means many list fetches/sec; Uber may throttle ('Fetching unassigned offer failed')
         REFRESH_ON: false,         // OFF: each toggle fires ~7 GraphQL queries; sustained toggling got the session 403'd on 2026-09-18
