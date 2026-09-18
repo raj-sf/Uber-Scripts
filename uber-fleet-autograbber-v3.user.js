@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
+// @version      3.2.0
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -26,6 +26,8 @@
         PICKUP_FROM: '',           // 'YYYY-MM-DD' (IST) or blank = no lower limit
         PICKUP_TO: '',             // 'YYYY-MM-DD' (IST) or blank = no upper limit
         SKIP_TODAY: false,         // quick switch: never accept pickups dated today (IST)
+        SETTLE_MS: 400,            // table must be free of DOM changes this long before we click (prevents clicking stale rows mid-render)
+        POST_REFRESH_MS: 800,      // after a tab toggle, wait this long before clicking anything
         SCAN_MS: 10,               // scan interval (ms). 10 = ~100 DOM scans/sec; CPU heavy but allowed
         REFRESH_MS: 150,           // tab toggle interval (ms). Warning: <1000 means many list fetches/sec; Uber may throttle ('Fetching unassigned offer failed')
         REFRESH_ON: true,          // toggle Announcements <-> Trip Management
@@ -188,11 +190,13 @@
     }
 
     // ---------- network recorder: Uber's own API calls for offers / accept ----------
-    const NET_MATCH = /offer|reservation|trip|accept|dispatch|supplier|fleet/i;
+    // Capture every request; only drop known high-volume noise. Uber uses RELATIVE urls,
+    // so a hostname-based match misses the real calls (this is why /flipr was all we ever saw).
+    const NET_SKIP = /\/flipr|\.(js|css|png|jpe?g|svg|gif|woff2?|ico|map)(\?|$)|analytics|metrics|beacon|sentry|datadog|segment/i;
     function netSave(entry) {
         try {
             const all = JSON.parse(localStorage.getItem(LS_NET) || '[]'); all.push(entry);
-            localStorage.setItem(LS_NET, JSON.stringify(all.slice(-80)));
+            localStorage.setItem(LS_NET, JSON.stringify(all.slice(-250)));
         } catch {}
         if (inFlight && inFlight.diag) inFlight.diag.events.push({ t: Date.now() - inFlight.startedAt, net: entry });
     }
@@ -205,7 +209,7 @@
             const started = Date.now();
             let body = null; try { body = init && typeof init.body === 'string' ? init.body.slice(0, 600) : null; } catch {}
             const res = await origFetch.apply(this, arguments);
-            if (NET_MATCH.test(url) && !/\.(js|css|png|svg|woff2?)(\?|$)/i.test(url)) {
+            if (!NET_SKIP.test(url)) {
                 let text = null;
                 try { text = (await res.clone().text()).slice(0, 800); } catch {}
                 netSave({ time: new Date().toISOString(), via: 'fetch', method, url: url.slice(0, 300), status: res.status, ms: Date.now() - started, reqBody: body, resBody: text });
@@ -216,7 +220,7 @@
         XMLHttpRequest.prototype.open = function (m, u) { this.__ufm = { method: m, url: String(u), started: 0 }; return origOpen.apply(this, arguments); };
         XMLHttpRequest.prototype.send = function (b) {
             const meta = this.__ufm;
-            if (meta && NET_MATCH.test(meta.url)) {
+            if (meta && !NET_SKIP.test(meta.url)) {
                 meta.started = Date.now(); meta.reqBody = typeof b === 'string' ? b.slice(0, 600) : null;
                 this.addEventListener('loadend', () => {
                     let text = null; try { text = String(this.responseText || '').slice(0, 800); } catch {}
@@ -319,6 +323,31 @@
         return true;
     }
 
+    // ---------- freshness guards ----------
+    let lastDomChange = 0;          // last time the results table changed
+    let lastRefreshAt = 0;          // last time we toggled tabs
+
+    function requestsCount() {
+        const els = document.querySelectorAll('button, [role="tab"], a, span, div');
+        for (const el of els) {
+            if (el.closest('#ufm3-panel')) continue;
+            const t = clean(el.textContent);
+            if (t.length > 30) continue;
+            const m = t.match(/Requests\((\d+)\)/);
+            if (m) return Number(m[1]);
+        }
+        return null;
+    }
+
+    // true when the table is settled and the tab counter agrees there are live offers
+    function listIsFresh() {
+        const n = requestsCount();
+        if (n === 0) return false;                                   // counter says nothing is on offer: rows on screen are ghosts
+        if (Date.now() - lastRefreshAt < S.POST_REFRESH_MS) return false;
+        if (lastDomChange && Date.now() - lastDomChange < S.SETTLE_MS) return false;
+        return true;
+    }
+
     function rowTripId(row) {
         const first = row.querySelector('td, [role="cell"], [role="gridcell"]');
         const id = clean(first ? first.textContent : '');
@@ -371,10 +400,16 @@
         return null;
     }
 
+    let skippedStale = 0;
     function scan() {
         if (!running) return;
         scanCount++;
         if (inFlight) { checkInFlight(); return; }
+
+        if (!listIsFresh()) {                                        // table mid-render or counter at 0: never click a ghost row
+            if (findMatch()) skippedStale++;
+            return;
+        }
 
         const matched = findMatch();
         const seen = lastSeen;
@@ -394,7 +429,7 @@
                 }
             }
         } else {
-            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>scans: ${scanCount} · refreshes: ${refreshCount} · last refresh: ${lastToggle ? Math.round((Date.now() - lastToggle) / 1000) + 's ago' : 'never'}`);
+            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>scans: ${scanCount} · refreshes: ${refreshCount} · offers: ${requestsCount()} · held(stale): ${skippedStale}`);
         }
     }
 
@@ -481,6 +516,7 @@
     }
 
     function forceRefresh() {
+        lastRefreshAt = Date.now();
         const a = findByText('Announcements'); if (a) fireClick(a);
         setTimeout(() => { const t = findByText('Trip Management'); if (t) fireClick(t); }, 700);
         setTimeout(() => { const req = findByTextPrefix('Requests'); if (req && req.getAttribute('aria-selected') !== 'true') fireClick(req); }, 1400);
@@ -522,7 +558,7 @@
         if (!running || !S.REFRESH_ON) return;
         if (inFlight) return;
         if (Date.now() - lastToggle < S.REFRESH_MS) return;
-        lastToggle = Date.now();
+        lastToggle = Date.now(); lastRefreshAt = Date.now();
         if (findMatch()) return;                        // hold only while a MATCHING trip is on screen
         if (refreshPhase === 0) {
             const a = findByText('Announcements');
@@ -568,6 +604,7 @@
                 const t = m.target;
                 if (t.id === 'ufm3-panel' || t.id === 'ufm3-popup' || (t.closest && (t.closest('#ufm3-panel') || t.closest('#ufm3-popup')))) continue;
                 if (m.addedNodes && m.addedNodes.length) {
+                    if (t.closest && (t.closest('table') || t.closest('[role="table"]') || t.closest('[role="grid"]'))) lastDomChange = Date.now();
                     clearTimeout(observerDebounce);
                     observerDebounce = setTimeout(scan, 150);
                     break;
@@ -684,6 +721,8 @@
             <label>Pickup to<input id="ufm3-pto" type="date" value="${S.PICKUP_TO}"></label>
             ${num('ufm3-scan', 'Scan every (ms)', S.SCAN_MS, 10)}
             ${num('ufm3-refresh', 'Refresh list every (ms)', S.REFRESH_MS, 100)}
+            ${num('ufm3-settle', 'Table settle before click (ms)', S.SETTLE_MS, 0)}
+            ${num('ufm3-postref', 'Quiet after refresh (ms)', S.POST_REFRESH_MS, 0)}
             ${chk('ufm3-refreshon', 'Tab-toggle refresh', S.REFRESH_ON)}
             ${chk('ufm3-sound', 'Sound', S.SOUND_ON)}
             ${chk('ufm3-notify', 'Desktop notification', S.NOTIFY_ON)}
@@ -711,6 +750,7 @@
         bind('ufm3-dry', 'DRY_RUN', 'bool'); bind('ufm3-cityon', 'CITY_FILTER_ON', 'bool'); bind('ufm3-city', 'CITY_LIST', 'text');
         bind('ufm3-skiptoday', 'SKIP_TODAY', 'bool'); bind('ufm3-pickupon', 'PICKUP_FILTER_ON', 'bool'); bind('ufm3-pfrom', 'PICKUP_FROM', 'text'); bind('ufm3-pto', 'PICKUP_TO', 'text');
         bind('ufm3-scan', 'SCAN_MS'); bind('ufm3-refresh', 'REFRESH_MS'); bind('ufm3-refreshon', 'REFRESH_ON', 'bool');
+        bind('ufm3-settle', 'SETTLE_MS'); bind('ufm3-postref', 'POST_REFRESH_MS');
         bind('ufm3-sound', 'SOUND_ON', 'bool'); bind('ufm3-notify', 'NOTIFY_ON', 'bool'); bind('ufm3-keep', 'KEEPALIVE_ON', 'bool');
 
         document.getElementById('ufm3-toggle').onclick = () => running ? stop() : start();
