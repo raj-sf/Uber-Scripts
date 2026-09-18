@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.4.0
+// @version      3.5.0
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -197,11 +197,24 @@
     // ok              : accepted, it is ours
     // taken           : someone else got there first
     // alreadyAccepted : offer already in accepted state - ambiguous, check the Accepted tab
-    function classifyAcceptResponse(json) {
+    function classifyAcceptResponse(json, status) {
         try {
-            if (!json || typeof json !== 'object') return { kind: 'error', label: 'no/!invalid accept response' };
+            // An HTTP error body (e.g. the 403 {"message":"forbidden by authentication server"})
+            // is a valid object with no .errors array. Without this check it read as ACCEPTED.
+            if (status !== undefined && status !== null && (status < 200 || status >= 300)) {
+                return { kind: 'error', label: 'HTTP ' + status + ' - NOT accepted' };
+            }
+            if (!json || typeof json !== 'object') return { kind: 'error', label: 'invalid accept response' };
             const errs = json.errors;
-            if (!errs || !errs.length) return { kind: 'ok', label: 'ACCEPTED' };
+            if (!errs || !errs.length) {
+                // success must be proven, never assumed from "no errors"
+                const data = json.data;
+                if (data && typeof data === 'object' && Object.keys(data).length &&
+                    Object.keys(data).some(k => data[k] !== null && data[k] !== undefined)) {
+                    return { kind: 'ok', label: 'ACCEPTED' };
+                }
+                return { kind: 'error', label: 'no accept confirmation in response' };
+            }
             const msg = String(errs[0].message || '');
             if (/already[- ]?exists|already\s+accepted/i.test(msg)) {
                 return { kind: 'alreadyAccepted', label: 'ALREADY ACCEPTED (verify in Accepted tab)', msg };
@@ -224,12 +237,33 @@
         } catch {}
         if (inFlight && inFlight.diag) inFlight.diag.events.push({ t: Date.now() - inFlight.startedAt, net: entry });
         try {
-            if (inFlight && !inFlight.apiResult && /AcceptOpenTripOffer/.test(entry.reqBody || '') && entry.resBody) {
-                inFlight.apiResult = classifyAcceptResponse(JSON.parse(entry.resBody));
-                log('accept API says: ' + inFlight.apiResult.label);
+            if (/AcceptOpenTripOffer/.test(entry.reqBody || '')) {
+                const uu = acceptUuidFromBody(entry.reqBody);
+                // Any accept we observe - ours, or the operator clicking in the Uber UI -
+                // retires that offer for BOTH paths, so they can never double-accept it.
+                if (uu) { handled[uu] = Date.now(); saveHandled(); }
+                if (inFlight) {
+                    if (uu && !inFlight.acceptUuid) inFlight.acceptUuid = uu;
+                    inFlight.acceptSeen = true;
+                    const started = Date.parse(entry.time) - (entry.ms || 0);
+                    const mine = !inFlight.acceptUuid || !uu || uu === inFlight.acceptUuid;
+                    if (!inFlight.apiResult && entry.resBody && mine && started >= inFlight.startedAt - 250) {
+                        let parsed = null; try { parsed = JSON.parse(entry.resBody); } catch {}
+                        inFlight.apiResult = classifyAcceptResponse(parsed, entry.status);
+                        log('accept API says: ' + inFlight.apiResult.label);
+                    }
+                }
             }
         } catch {}
     }
+    function acceptUuidFromBody(body) {
+        try {
+            const j = JSON.parse(body);
+            const v = j && j.variables && j.variables.offerUuid;
+            return (v && (typeof v === 'string' ? v : v.value)) || null;
+        } catch { return null; }
+    }
+
     // ---------- direct GraphQL engine ----------
     let GQL = (function () { try { return JSON.parse(localStorage.getItem(LS_GQL) || '{}'); } catch { return {}; } })();
     function saveGql() { try { localStorage.setItem(LS_GQL, JSON.stringify(GQL)); } catch {} }
@@ -288,14 +322,23 @@
         a.download = 'uber-grabber-net.json'; a.click();
     }
 
-    async function gqlPost(body) {
+    async function gqlPost(body, timeoutMs) {
         const f = window.__ufm3OrigFetch || window.fetch;
-        const res = await f.call(window, GQL.url, {
-            method: 'POST', credentials: 'include',
-            headers: Object.assign({ 'content-type': 'application/json' }, GQL.headers || {}),
-            body
-        });
-        return res.json();
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, timeoutMs || 8000) : null;
+        try {
+            const opts = {
+                method: 'POST', credentials: 'include',
+                headers: Object.assign({ 'content-type': 'application/json' }, GQL.headers || {}),
+                body
+            };
+            if (ctrl) opts.signal = ctrl.signal;
+            const res = await f.call(window, GQL.url, opts);
+            // direct-mode traffic bypasses the wrapped fetch, so arm the breaker here
+            try { noteHttpStatus(res.status, GQL.url); } catch {}
+            let json = null; try { json = await res.json(); } catch {}
+            return { status: res.status, ok: res.ok, json };
+        } finally { if (timer) clearTimeout(timer); }
     }
 
     // find the array of offers anywhere in the response
@@ -317,7 +360,9 @@
                 const v = x[k];
                 if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v) && /pickup|start|begin|scheduled/i.test(k)) seen.push(Date.parse(v));
                 else if ((typeof v === 'number' || (typeof v === 'string' && /^\d{10,13}$/.test(v))) && /pickup|start|begin|scheduled/i.test(k)) {
-                    const num = Number(v); seen.push(num > 1e12 ? num : num * 1000);
+                    const num = Number(v); const ms = num > 1e12 ? num : num * 1000;
+                    const now = Date.now();
+                    if (ms > now - 86400000 * 30 && ms < now + 86400000 * 400) seen.push(ms);   // reject nonsense epochs
                 } else if (v && typeof v === 'object') walk(v);
             });
         })(o);
@@ -334,6 +379,7 @@
         }
         if (S.SKIP_TODAY || S.PICKUP_FILTER_ON) {
             const ms = offerPickupMs(o);
+            if (ms === null) return false;              // fail CLOSED: never accept when the date filter cannot be evaluated
             if (ms !== null) {
                 const day = istDateString(ms);
                 if (S.SKIP_TODAY && day === istDateString(Date.now())) return false;
@@ -367,14 +413,18 @@
     }
     function status_(m) { const el = document.getElementById('ufm3-status'); if (el) el.innerHTML = '<b style="color:#ff6b6b">' + m + '</b>'; }
 
-    let directBusy = false, directPolls = 0, directSeen = 0;
+    let directBusy = false, directPolls = 0, directSeen = 0, lastPollOkAt = 0, lastDomAcceptAt = 0;
     async function directTick() {
         if (authBlocked) return;
         if (!running || !S.DIRECT_MODE || directBusy || !gqlReady()) return;
+        if (inFlight || Date.now() - lastDomAcceptAt < 15000) return;   // a DOM accept is outstanding
         directBusy = true;
         try {
-            const j = await gqlPost(GQL.offersBody);
-            const offers = extractOffers(j);
+            const pj = await gqlPost(GQL.offersBody, 5000);
+            if (!running || authBlocked || !S.DIRECT_MODE) return;      // state may have changed across the await
+            if (!pj.ok) { log('offers poll HTTP ' + pj.status); return; }
+            lastPollOkAt = Date.now();
+            const offers = extractOffers(pj.json);
             directPolls++; directSeen = offers.length;
             for (const o of offers) {
                 const uu = offerUuid(o); if (!uu) continue;
@@ -383,23 +433,44 @@
                 if (handled[key] || dryHandled.has(key)) continue;
                 if (!offerMatches(o)) continue;
 
-                if (S.DRY_RUN) { dryHandled.add(key); addLog({ id: uu.slice(0, 8), fare, result: 'DRY RUN match (direct)' }); startBeepLoop(); break; }
+                // alert-only mode must NEVER book a trip through the direct path
+                if (S.DRY_RUN || !S.AUTO_ACCEPT) {
+                    dryHandled.add(key);
+                    addLog({ id: uu.slice(0, 8), fare, result: S.DRY_RUN ? 'DRY RUN match (direct)' : 'ALERT - manual accept needed (direct)' });
+                    notify({ fare, id: uu.slice(0, 8) }, 'Trip match');
+                    startBeepLoop();
+                    break;
+                }
 
                 const now = Date.now();
                 acceptTimes = acceptTimes.filter(t => now - t < 60000);
                 if (acceptTimes.length >= S.MAX_ACCEPTS_PER_MIN) { status('Accept cap reached this minute'); break; }
-                acceptTimes.push(now); handled[key] = now; saveHandled();
 
                 const t0 = Date.now();
                 let body; try { const b = JSON.parse(GQL.acceptBody); b.variables.offerUuid = { value: uu }; body = JSON.stringify(b); }
                 catch (e) { log('accept template broken: ' + e); break; }
-                const r = await gqlPost(body);
-                const ms = Date.now() - t0;
-                const cls = classifyAcceptResponse(r);
+                if (!running || authBlocked) break;                     // re-check right before we spend money
+                acceptTimes.push(now);
+                handled[key] = now; saveHandled();                      // reserve, then confirm or release below
+                let cls, ms;
+                try {
+                    const r = await gqlPost(body, 8000);
+                    ms = Date.now() - t0;
+                    cls = classifyAcceptResponse(r.json, r.status);
+                } catch (e) {
+                    // no verdict: release the reservation so the offer is retried instead of silently burned
+                    delete handled[key]; saveHandled();
+                    addLog({ id: uu.slice(0, 8), fare, result: 'ACCEPT FAILED (no verdict): ' + String(e).slice(0, 60) + ' - re-armed' });
+                    tone(440, 0.3, 0.3);
+                    break;
+                }
                 addLog({ id: uu.slice(0, 8), fare, result: cls.label + ' (direct, ' + ms + 'ms)' });
                 if (cls.kind === 'ok' || cls.kind === 'alreadyAccepted') {
                     playAcceptTone(); notify({ fare, id: uu.slice(0, 8) }, cls.kind === 'ok' ? 'Accepted' : 'Already accepted');
-                } else { tone(440, 0.3, 0.3); }
+                } else {
+                    if (cls.kind === 'error') { delete handled[key]; saveHandled(); }   // transient: allow a retry
+                    tone(440, 0.3, 0.3);
+                }
                 break;   // one at a time
             }
         } catch (e) { log('direct poll error: ' + e); }
@@ -615,6 +686,7 @@
         inFlight = { id: m.id, fare: m.fare, startedAt: now, row: m.row, btn: m.btn, confirmed: false, retried: false, baseline: new Set(pageMessages()), lastCheck: 0 };
         inFlight.diag = diagStart(m); inFlight.diag.beforeSet = new Set(inFlight.diag.before);
         acceptTimes.push(now);
+        lastDomAcceptAt = Date.now();
         status(`Accepting ₹${m.fare.toLocaleString('en-IN')} (${m.id})…`);
         log(`ACCEPT click ₹${m.fare} ${m.id}`);
         requestAnimationFrame(() => fireClick(m.btn));
@@ -660,11 +732,22 @@
         const liveRow = findRowById(f.id);
         const msgs = pageMessages().filter(x => !f.baseline.has(x));   // only messages that appeared AFTER our click
         if (msgs.length) f.lastMsg = msgs.join(' | ');
+
+        // A row also disappears when SOMEONE ELSE takes the trip, so a vanished row is not
+        // proof of a win. Check the loss evidence first, and never report ACCEPTED from the DOM.
         if (!liveRow && elapsed > 800) {
-            finishInFlight('ACCEPTED');
+            if (/no longer available|already accepted|trip acceptance failed/i.test(f.lastMsg || '')) {
+                finishInFlight('TAKEN by someone else');
+            } else if (f.acceptSeen) {
+                finishInFlight('SENT, awaiting verdict - verify in Accepted tab');
+            } else {
+                finishInFlight('UNKNOWN (row gone, no accept seen) - verify in Accepted tab');
+            }
             return;
         }
-        if (/no longer available|already (been )?accepted|not available|unavailable|taken|expired|something went wrong|please refresh|failed/i.test(f.lastMsg || '')) {
+        // scoped to ACCEPT wording: the bare /failed/ used to match the unrelated
+        // "Fetching unassigned offer failed" list error and abort a live accept
+        if (/trip acceptance failed|no longer available|already (been )?accepted|offer (is )?not available|unavailable|expired/i.test(f.lastMsg || '')) {
             finishInFlight('LOST: ' + f.lastMsg.slice(0, 90));
             setTimeout(closeToasts, 200);
             if (/please refresh|failed/i.test(f.lastMsg)) {
@@ -916,7 +999,7 @@
             if (key === 'SCAN_MS') { S.SCAN_MS = Math.max(10, S.SCAN_MS || 10); e.target.value = S.SCAN_MS; }
             if (key === 'REFRESH_MS') { S.REFRESH_MS = Math.max(100, S.REFRESH_MS || 150); e.target.value = S.REFRESH_MS; }
             saveSettings();
-            if (running && (key === 'SCAN_MS' || key === 'REFRESH_MS')) startTimers();
+            if (running && (key === 'SCAN_MS' || key === 'REFRESH_MS' || key === 'DIRECT_POLL_MS')) startTimers();
             if (key === 'KEEPALIVE_ON') { S.KEEPALIVE_ON ? startKeepAlive() : stopKeepAlive(); }
             if ((key === 'DRY_RUN' && !S.DRY_RUN) || (key === 'AUTO_ACCEPT' && S.AUTO_ACCEPT)) { dryHandled.clear(); stopBeepLoop(); status('Live mode: dry-run matches are eligible again'); }
         });
@@ -969,7 +1052,13 @@
         scan();
     }
     function stop() {
-        running = false; stopTimers(); stopKeepAlive(); stopBeepLoop(); inFlight = null;
+        running = false; stopTimers(); stopKeepAlive(); stopBeepLoop();
+        if (inFlight) {                                   // never drop an accept silently
+            const f = inFlight; inFlight = null;
+            try { diagSave(f, 'ABORTED'); } catch {}
+            addLog({ id: f.id, fare: f.fare, result: f.acceptSeen ? 'ABORTED after accept was sent - VERIFY in Accepted tab' : 'ABORTED before accept' });
+        }
+        inFlight = null;
         if (observer) observer.disconnect();
         document.getElementById('ufm3-toggle').textContent = 'START';
         document.getElementById('ufm3-toggle').classList.remove('on');
