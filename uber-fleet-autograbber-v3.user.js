@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.3.1
+// @version      3.4.0
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -193,6 +193,26 @@
         });
     }
 
+    // ---------- accept-response classifier (Uber's API is the source of truth) ----------
+    // ok              : accepted, it is ours
+    // taken           : someone else got there first
+    // alreadyAccepted : offer already in accepted state - ambiguous, check the Accepted tab
+    function classifyAcceptResponse(json) {
+        try {
+            if (!json || typeof json !== 'object') return { kind: 'error', label: 'no/!invalid accept response' };
+            const errs = json.errors;
+            if (!errs || !errs.length) return { kind: 'ok', label: 'ACCEPTED' };
+            const msg = String(errs[0].message || '');
+            if (/already[- ]?exists|already\s+accepted/i.test(msg)) {
+                return { kind: 'alreadyAccepted', label: 'ALREADY ACCEPTED (verify in Accepted tab)', msg };
+            }
+            if (/no longer available|not available|expired|non-actionable/i.test(msg)) {
+                return { kind: 'taken', label: 'TAKEN by someone else', msg };
+            }
+            return { kind: 'error', label: 'API error: ' + msg.slice(0, 80), msg };
+        } catch (e) { return { kind: 'error', label: 'unparsable accept response' }; }
+    }
+
     // ---------- network recorder: Uber's own API calls for offers / accept ----------
     // Capture every request; only drop known high-volume noise. Uber uses RELATIVE urls,
     // so a hostname-based match misses the real calls (this is why /flipr was all we ever saw).
@@ -203,6 +223,12 @@
             localStorage.setItem(LS_NET, JSON.stringify(all.slice(-250)));
         } catch {}
         if (inFlight && inFlight.diag) inFlight.diag.events.push({ t: Date.now() - inFlight.startedAt, net: entry });
+        try {
+            if (inFlight && !inFlight.apiResult && /AcceptOpenTripOffer/.test(entry.reqBody || '') && entry.resBody) {
+                inFlight.apiResult = classifyAcceptResponse(JSON.parse(entry.resBody));
+                log('accept API says: ' + inFlight.apiResult.label);
+            }
+        } catch {}
     }
     // ---------- direct GraphQL engine ----------
     let GQL = (function () { try { return JSON.parse(localStorage.getItem(LS_GQL) || '{}'); } catch { return {}; } })();
@@ -368,16 +394,12 @@
                 let body; try { const b = JSON.parse(GQL.acceptBody); b.variables.offerUuid = { value: uu }; body = JSON.stringify(b); }
                 catch (e) { log('accept template broken: ' + e); break; }
                 const r = await gqlPost(body);
-                const err = r && r.errors && r.errors[0] && r.errors[0].message;
                 const ms = Date.now() - t0;
-                if (err) {
-                    const short = /no longer available/i.test(err) ? 'TAKEN by someone else' : err.slice(0, 80);
-                    addLog({ id: uu.slice(0, 8), fare, result: 'DIRECT FAIL (' + ms + 'ms): ' + short });
-                    tone(440, 0.3, 0.3);
-                } else {
-                    addLog({ id: uu.slice(0, 8), fare, result: 'ACCEPTED (direct, ' + ms + 'ms)' });
-                    playAcceptTone(); notify({ fare, id: uu.slice(0, 8) }, 'Accepted');
-                }
+                const cls = classifyAcceptResponse(r);
+                addLog({ id: uu.slice(0, 8), fare, result: cls.label + ' (direct, ' + ms + 'ms)' });
+                if (cls.kind === 'ok' || cls.kind === 'alreadyAccepted') {
+                    playAcceptTone(); notify({ fare, id: uu.slice(0, 8) }, cls.kind === 'ok' ? 'Accepted' : 'Already accepted');
+                } else { tone(440, 0.3, 0.3); }
                 break;   // one at a time
             }
         } catch (e) { log('direct poll error: ' + e); }
@@ -605,16 +627,15 @@
         f.lastCheck = Date.now();
         diagTick(f);
 
-        // retry once at 1.5 s: click the innermost child of the (re-found) button, in case the first click hit a re-rendered node
-        if (!f.retried && elapsed > 1500) {
-            f.retried = true;
-            const row = findRowById(f.id);
-            const b = row ? row.querySelector(SEL.acceptBtn + ', button') : null;
-            if (b && /^accept$/i.test(clean(b.textContent))) {
-                let inner = b; while (inner.firstElementChild) inner = inner.firstElementChild;
-                log('retry click on inner element'); fireClick(inner); fireClick(b);
-                if (f.diag) f.diag.events.push({ t: elapsed, retry: true });
-            }
+        // NO retry click. Measured 2026-09-18: the old 1.5 s retry fired a SECOND
+        // AcceptOpenTripOffer; Uber answered "Offer is already accepted" (already-exists)
+        // and a trip we had actually won was logged as a loss.
+
+        // Uber's answer to our accept call is authoritative - stop guessing from toasts.
+        if (f.apiResult) {
+            const r = f.apiResult;
+            finishInFlight(r.kind === 'ok' ? 'ACCEPTED' : r.label);
+            return;
         }
 
         // 1) confirm dialog that appeared AFTER our click, inside a modal only
@@ -675,7 +696,8 @@
         diagSave(f, result);
         addLog({ id: f.id, fare: f.fare, result });
         if (result === 'ACCEPTED') { playAcceptTone(); notify({ fare: f.fare, id: f.id }, 'Accepted'); }
-        else if (result.startsWith('LOST')) { tone(440, 0.3, 0.3); }
+        else if (result.startsWith('ALREADY ACCEPTED')) { playAcceptTone(); notify({ fare: f.fare, id: f.id }, 'Already accepted'); }
+        else if (result.startsWith('LOST') || result.startsWith('TAKEN')) { tone(440, 0.3, 0.3); }
         else { startBeepLoop(); unhandledMatch = { key: f.id, fare: f.fare, id: f.id }; }
         status(`${result}: ₹${f.fare.toLocaleString('en-IN')} (${f.id})`);
     }
