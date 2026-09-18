@@ -21,7 +21,7 @@
         AUTO_ACCEPT: true,         // false = alert only (behaves like V2)
         DRY_RUN: false,            // true = highlight + log + beep, but never click Accept (memory-only, does not mark trips handled).
         CITY_FILTER_ON: false,     // optional: only accept if pickup/stop city text matches
-        CITY_LIST: 'Chennai',      // comma separated, case-insensitive substring match
+        CITY_LIST: 'Chennai,Pallavaram,Tambaram,Chromepet,Chrompet,Anakaputhur,Ambattur,Avadi,Poonamallee,Porur,Velachery,Adyar,Guindy,Perungudi,Sholinganallur,Thoraipakkam,Pallikaranai,Medavakkam,Madipakkam,Alandur,Perambur,Villivakkam,Madhavaram,Tiruvottiyur,Thiruvottiyur,Anna Nagar,T Nagar,Triplicane,Mylapore,Nungambakkam,Egmore,Kodambakkam,Saidapet,Vadapalani,Ashok Nagar,Besant Nagar,Thiruvanmiyur,Kelambakkam,Siruseri,Navalur',      // comma separated, case-insensitive substring match
         PICKUP_FILTER_ON: false,   // only accept if pickup date is inside the window below (IST)
         PICKUP_FROM: '',           // 'YYYY-MM-DD' (IST) or blank = no lower limit
         PICKUP_TO: '',             // 'YYYY-MM-DD' (IST) or blank = no upper limit
