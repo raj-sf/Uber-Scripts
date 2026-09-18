@@ -6,7 +6,7 @@ Tampermonkey userscripts for the Uber Fleet Supplier Portal (Trip Management pag
 
 | File | What it does |
 |---|---|
-| `uber-fleet-autograbber-v3.user.js` | **Use this one.** Scans Trip Management, reads the Fare column exactly, filters by pickup date (skip today, or a from/to window, IST), auto-accepts trips inside the configured fare range, confirms only the dialog it opened, keeps the request list fresh by toggling Announcements/Trip Management, keeps running in a background tab (Web Worker timer + inaudible keep-alive tone), logs every accept (CSV export). Panel with min/max fare, optional city filter, intervals, sound, dry run. |
+| `uber-fleet-autograbber-v3.user.js` | **Use this one.** **DIRECT API mode (v3.3.0):** learns Uber's own GraphQL calls (`GetInProgressTripReservationOffers` / `AcceptOpenTripOffer`) and accepts straight over the API, skipping the DOM entirely. Falls back to clicking until the templates are learned. Scans Trip Management, reads the Fare column exactly, filters by pickup date (skip today, or a from/to window, IST), auto-accepts trips inside the configured fare range, confirms only the dialog it opened, keeps the request list fresh by toggling Announcements/Trip Management, keeps running in a background tab (Web Worker timer + inaudible keep-alive tone), logs every accept (CSV export). Panel with min/max fare, optional city filter, intervals, sound, dry run. |
 
 ### Install
 1. Tampermonkey > Create a new script > paste the file > save.
@@ -29,3 +29,21 @@ Sounds: two rising tones = accepted. Continuous beep = a match needs a human (al
 ## Notes
 - Selectors come from the scripts that worked on the portal: Accept = `button[data-testid="trip-reservation-table-action-button"]`, confirm buttons = `button[data-baseweb="button"]` inside a modal.
 - If V3 logs `TIMEOUT` on a match, the confirm dialog or Accept button markup changed; nothing is clicked in that case.
+
+## Why DOM clicking loses trips (measured 2026-09-18)
+
+Captured from Uber's own API during a failed accept:
+
+```
+POST /graphql  AcceptOpenTripOffer
+  -> {"errors":[{"message":"Offer is no longer available,
+       Cause: failed-precondition ... Trigger is non-actionable for current state"}]}
+```
+
+The offer list query (`GetInProgressTripReservationOffers`) took **1485 ms** to return.
+So the table on screen is already >1.5 s stale before a human or a DOM clicker ever sees it.
+By the time a click walks through React and reaches the server, the offer is gone.
+
+Direct API mode removes that whole chain: poll the offers query, and the moment a matching
+offer appears in the JSON, fire `AcceptOpenTripOffer` with its uuid. No render, no stale row,
+no tab toggling.

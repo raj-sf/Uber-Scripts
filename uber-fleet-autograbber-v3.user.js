@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.2.0
+// @version      3.3.0
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -28,6 +28,8 @@
         SKIP_TODAY: false,         // quick switch: never accept pickups dated today (IST)
         SETTLE_MS: 400,            // table must be free of DOM changes this long before we click (prevents clicking stale rows mid-render)
         POST_REFRESH_MS: 800,      // after a tab toggle, wait this long before clicking anything
+        DIRECT_MODE: true,         // talk to Uber's GraphQL API directly instead of clicking DOM buttons (much faster, no stale rows)
+        DIRECT_POLL_MS: 400,       // how often to poll the offers query in direct mode
         SCAN_MS: 10,               // scan interval (ms). 10 = ~100 DOM scans/sec; CPU heavy but allowed
         REFRESH_MS: 150,           // tab toggle interval (ms). Warning: <1000 means many list fetches/sec; Uber may throttle ('Fetching unassigned offer failed')
         REFRESH_ON: true,          // toggle Announcements <-> Trip Management
@@ -44,6 +46,7 @@
     const LS_LOG = 'ufm3.log';
     const LS_DIAG = 'ufm3.diag';
     const LS_NET = 'ufm3.net';
+    const LS_GQL = 'ufm3.gql';
 
     const SEL = {
         acceptBtn: 'button[data-testid="trip-reservation-table-action-button"]',
@@ -61,6 +64,7 @@
     let worker = null;
     let pageTimer = null;
     let refreshTimer = null;
+    let directTimer = null;
     let observer = null;
     let observerDebounce = null;
     let inFlight = null;                // { id, fare, startedAt }
@@ -200,30 +204,49 @@
         } catch {}
         if (inFlight && inFlight.diag) inFlight.diag.events.push({ t: Date.now() - inFlight.startedAt, net: entry });
     }
+    // ---------- direct GraphQL engine ----------
+    let GQL = (function () { try { return JSON.parse(localStorage.getItem(LS_GQL) || '{}'); } catch { return {}; } })();
+    function saveGql() { try { localStorage.setItem(LS_GQL, JSON.stringify(GQL)); } catch {} }
+    function learnGql(url, headers, body) {
+        if (!/graphql/i.test(url) || typeof body !== 'string') return;
+        let j; try { j = JSON.parse(body); } catch { return; }
+        const op = String(j.operationName || '');
+        if (/GetInProgressTripReservationOffers/i.test(op)) { GQL.url = url; GQL.offersBody = body; if (headers) GQL.headers = headers; saveGql(); }
+        else if (/AcceptOpenTripOffer/i.test(op)) { GQL.url = url; GQL.acceptBody = body; if (headers) GQL.headers = headers; saveGql(); }
+    }
+    function gqlReady() { return !!(GQL.url && GQL.offersBody && GQL.acceptBody); }
+
     function installNetRecorder() {
         if (window.__ufm3NetInstalled) return; window.__ufm3NetInstalled = true;
         const origFetch = window.fetch;
+        window.__ufm3OrigFetch = origFetch;
         window.fetch = async function (input, init) {
             const url = typeof input === 'string' ? input : (input && input.url) || '';
             const method = (init && init.method) || (input && input.method) || 'GET';
             const started = Date.now();
-            let body = null; try { body = init && typeof init.body === 'string' ? init.body.slice(0, 600) : null; } catch {}
+            let body = null; try { body = init && typeof init.body === 'string' ? init.body.slice(0, 4000) : null; } catch {}
+            let hdrs = null;
+            try { if (init && init.headers) { hdrs = {}; new Headers(init.headers).forEach((v, k) => { hdrs[k] = v; }); } } catch {}
+            try { learnGql(url, hdrs, body); } catch {}
             const res = await origFetch.apply(this, arguments);
             if (!NET_SKIP.test(url)) {
                 let text = null;
-                try { text = (await res.clone().text()).slice(0, 800); } catch {}
+                try { text = (await res.clone().text()).slice(0, 3000); } catch {}
                 netSave({ time: new Date().toISOString(), via: 'fetch', method, url: url.slice(0, 300), status: res.status, ms: Date.now() - started, reqBody: body, resBody: text });
             }
             return res;
         };
         const origOpen = XMLHttpRequest.prototype.open, origSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (m, u) { this.__ufm = { method: m, url: String(u), started: 0 }; return origOpen.apply(this, arguments); };
+        const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+        XMLHttpRequest.prototype.open = function (m, u) { this.__ufm = { method: m, url: String(u), started: 0, headers: {} }; return origOpen.apply(this, arguments); };
+        XMLHttpRequest.prototype.setRequestHeader = function (k, v) { try { if (this.__ufm) this.__ufm.headers[String(k).toLowerCase()] = String(v); } catch {} return origSetHeader.apply(this, arguments); };
         XMLHttpRequest.prototype.send = function (b) {
             const meta = this.__ufm;
+            try { if (meta) learnGql(meta.url, meta.headers, typeof b === 'string' ? b : null); } catch {}
             if (meta && !NET_SKIP.test(meta.url)) {
-                meta.started = Date.now(); meta.reqBody = typeof b === 'string' ? b.slice(0, 600) : null;
+                meta.started = Date.now(); meta.reqBody = typeof b === 'string' ? b.slice(0, 4000) : null;
                 this.addEventListener('loadend', () => {
-                    let text = null; try { text = String(this.responseText || '').slice(0, 800); } catch {}
+                    let text = null; try { text = String(this.responseText || '').slice(0, 3000); } catch {}
                     netSave({ time: new Date().toISOString(), via: 'xhr', method: meta.method, url: meta.url.slice(0, 300), status: this.status, ms: Date.now() - meta.started, reqBody: meta.reqBody, resBody: text });
                 });
             }
@@ -235,6 +258,106 @@
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([localStorage.getItem(LS_NET) || '[]'], { type: 'application/json' }));
         a.download = 'uber-grabber-net.json'; a.click();
+    }
+
+    async function gqlPost(body) {
+        const f = window.__ufm3OrigFetch || window.fetch;
+        const res = await f.call(window, GQL.url, {
+            method: 'POST', credentials: 'include',
+            headers: Object.assign({ 'content-type': 'application/json' }, GQL.headers || {}),
+            body
+        });
+        return res.json();
+    }
+
+    // find the array of offers anywhere in the response
+    function extractOffers(obj, out) {
+        out = out || [];
+        if (!obj || typeof obj !== 'object') return out;
+        if (Array.isArray(obj)) { obj.forEach(x => extractOffers(x, out)); return out; }
+        if (obj.uuid && obj.fareDetails) out.push(obj);
+        Object.keys(obj).forEach(k => { const v = obj[k]; if (v && typeof v === 'object') extractOffers(v, out); });
+        return out;
+    }
+    function offerUuid(o) { return typeof o.uuid === 'string' ? o.uuid : (o.uuid && o.uuid.value) || null; }
+    function offerFare(o) { try { return parseRupee(o.fareDetails.displayFare); } catch { return null; } }
+    function offerPickupMs(o) {
+        const seen = [];
+        (function walk(x) {
+            if (!x || typeof x !== 'object') return;
+            Object.keys(x).forEach(k => {
+                const v = x[k];
+                if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v) && /pickup|start|begin|scheduled/i.test(k)) seen.push(Date.parse(v));
+                else if ((typeof v === 'number' || (typeof v === 'string' && /^\d{10,13}$/.test(v))) && /pickup|start|begin|scheduled/i.test(k)) {
+                    const num = Number(v); seen.push(num > 1e12 ? num : num * 1000);
+                } else if (v && typeof v === 'object') walk(v);
+            });
+        })(o);
+        const valid = seen.filter(x => Number.isFinite(x));
+        return valid.length ? Math.min.apply(null, valid) : null;
+    }
+    function offerMatches(o) {
+        const fare = offerFare(o);
+        if (fare === null || fare < S.MIN_FARE || fare > S.MAX_FARE) return false;
+        const blob = JSON.stringify(o).toLowerCase();
+        if (S.CITY_FILTER_ON) {
+            const list = S.CITY_LIST.split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+            if (list.length && !list.some(c => blob.includes(c))) return false;
+        }
+        if (S.SKIP_TODAY || S.PICKUP_FILTER_ON) {
+            const ms = offerPickupMs(o);
+            if (ms !== null) {
+                const day = istDateString(ms);
+                if (S.SKIP_TODAY && day === istDateString(Date.now())) return false;
+                if (S.PICKUP_FILTER_ON) {
+                    if (S.PICKUP_FROM && day < S.PICKUP_FROM) return false;
+                    if (S.PICKUP_TO && day > S.PICKUP_TO) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    let directBusy = false, directPolls = 0, directSeen = 0;
+    async function directTick() {
+        if (!running || !S.DIRECT_MODE || directBusy || !gqlReady()) return;
+        directBusy = true;
+        try {
+            const j = await gqlPost(GQL.offersBody);
+            const offers = extractOffers(j);
+            directPolls++; directSeen = offers.length;
+            for (const o of offers) {
+                const uu = offerUuid(o); if (!uu) continue;
+                const fare = offerFare(o);
+                const key = uu;
+                if (handled[key] || dryHandled.has(key)) continue;
+                if (!offerMatches(o)) continue;
+
+                if (S.DRY_RUN) { dryHandled.add(key); addLog({ id: uu.slice(0, 8), fare, result: 'DRY RUN match (direct)' }); startBeepLoop(); break; }
+
+                const now = Date.now();
+                acceptTimes = acceptTimes.filter(t => now - t < 60000);
+                if (acceptTimes.length >= S.MAX_ACCEPTS_PER_MIN) { status('Accept cap reached this minute'); break; }
+                acceptTimes.push(now); handled[key] = now; saveHandled();
+
+                const t0 = Date.now();
+                let body; try { const b = JSON.parse(GQL.acceptBody); b.variables.offerUuid = { value: uu }; body = JSON.stringify(b); }
+                catch (e) { log('accept template broken: ' + e); break; }
+                const r = await gqlPost(body);
+                const err = r && r.errors && r.errors[0] && r.errors[0].message;
+                const ms = Date.now() - t0;
+                if (err) {
+                    const short = /no longer available/i.test(err) ? 'TAKEN by someone else' : err.slice(0, 80);
+                    addLog({ id: uu.slice(0, 8), fare, result: 'DIRECT FAIL (' + ms + 'ms): ' + short });
+                    tone(440, 0.3, 0.3);
+                } else {
+                    addLog({ id: uu.slice(0, 8), fare, result: 'ACCEPTED (direct, ' + ms + 'ms)' });
+                    playAcceptTone(); notify({ fare, id: uu.slice(0, 8) }, 'Accepted');
+                }
+                break;   // one at a time
+            }
+        } catch (e) { log('direct poll error: ' + e); }
+        finally { directBusy = false; }
     }
 
     // ---------- diagnostics recorder: what changed on the page after our click ----------
@@ -406,6 +529,7 @@
         scanCount++;
         if (inFlight) { checkInFlight(); return; }
 
+        if (S.DIRECT_MODE && gqlReady()) return;                     // direct API is handling accepts; do not also click the DOM
         if (!listIsFresh()) {                                        // table mid-render or counter at 0: never click a ghost row
             if (findMatch()) skippedStale++;
             return;
@@ -429,7 +553,7 @@
                 }
             }
         } else {
-            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>scans: ${scanCount} · refreshes: ${refreshCount} · offers: ${requestsCount()} · held(stale): ${skippedStale}`);
+            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>${S.DIRECT_MODE ? (gqlReady() ? `DIRECT API · polls: ${directPolls} · offers seen: ${directSeen}` : 'DIRECT API: waiting to learn Uber\'s API (open/refresh the list once)') : `scans: ${scanCount} · refreshes: ${refreshCount} · held(stale): ${skippedStale}`}`);
         }
     }
 
@@ -589,11 +713,13 @@
         }
         pageTimer = setInterval(scan, Math.max(S.SCAN_MS, 1000));   // backup
         refreshTimer = setInterval(refreshTick, S.REFRESH_MS);
+        directTimer = setInterval(directTick, S.DIRECT_POLL_MS);
     }
     function stopTimers() {
         if (worker) { try { worker.postMessage({ cmd: 'stop' }); worker.terminate(); } catch {} worker = null; }
         if (pageTimer) { clearInterval(pageTimer); pageTimer = null; }
         if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+        if (directTimer) { clearInterval(directTimer); directTimer = null; }
     }
 
     function startObserver() {
@@ -723,6 +849,8 @@
             ${num('ufm3-refresh', 'Refresh list every (ms)', S.REFRESH_MS, 100)}
             ${num('ufm3-settle', 'Table settle before click (ms)', S.SETTLE_MS, 0)}
             ${num('ufm3-postref', 'Quiet after refresh (ms)', S.POST_REFRESH_MS, 0)}
+            ${chk('ufm3-direct', 'DIRECT API mode (recommended)', S.DIRECT_MODE)}
+            ${num('ufm3-dpoll', 'Direct poll every (ms)', S.DIRECT_POLL_MS, 100)}
             ${chk('ufm3-refreshon', 'Tab-toggle refresh', S.REFRESH_ON)}
             ${chk('ufm3-sound', 'Sound', S.SOUND_ON)}
             ${chk('ufm3-notify', 'Desktop notification', S.NOTIFY_ON)}
@@ -751,6 +879,7 @@
         bind('ufm3-skiptoday', 'SKIP_TODAY', 'bool'); bind('ufm3-pickupon', 'PICKUP_FILTER_ON', 'bool'); bind('ufm3-pfrom', 'PICKUP_FROM', 'text'); bind('ufm3-pto', 'PICKUP_TO', 'text');
         bind('ufm3-scan', 'SCAN_MS'); bind('ufm3-refresh', 'REFRESH_MS'); bind('ufm3-refreshon', 'REFRESH_ON', 'bool');
         bind('ufm3-settle', 'SETTLE_MS'); bind('ufm3-postref', 'POST_REFRESH_MS');
+        bind('ufm3-direct', 'DIRECT_MODE', 'bool'); bind('ufm3-dpoll', 'DIRECT_POLL_MS');
         bind('ufm3-sound', 'SOUND_ON', 'bool'); bind('ufm3-notify', 'NOTIFY_ON', 'bool'); bind('ufm3-keep', 'KEEPALIVE_ON', 'bool');
 
         document.getElementById('ufm3-toggle').onclick = () => running ? stop() : start();
