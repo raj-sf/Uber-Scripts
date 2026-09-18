@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.5.0
+// @version      3.5.1
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -29,7 +29,11 @@
         SETTLE_MS: 400,            // table must be free of DOM changes this long before we click (prevents clicking stale rows mid-render)
         POST_REFRESH_MS: 800,      // after a tab toggle, wait this long before clicking anything
         DIRECT_MODE: true,         // talk to Uber's GraphQL API directly instead of clicking DOM buttons (much faster, no stale rows)
-        DIRECT_POLL_MS: 400,       // how often to poll the offers query in direct mode
+        DIRECT_POLL_MS: 400,       // how often to poll the offers queries in direct mode
+        // Which offer lists to poll, best first. AcceptOpenTripOffer accepts OPEN offers;
+        // Unassigned is the other list that carries acceptable requests. Do NOT add
+        // Assigned/InProgress/Completed here - those are trips already taken.
+        DIRECT_SOURCES: 'GetOpenTripReservationOffers,GetUnassignedTripReservationOffers',
         SCAN_MS: 10,               // scan interval (ms). 10 = ~100 DOM scans/sec; CPU heavy but allowed
         REFRESH_MS: 150,           // tab toggle interval (ms). Warning: <1000 means many list fetches/sec; Uber may throttle ('Fetching unassigned offer failed')
         REFRESH_ON: false,         // OFF: each toggle fires ~7 GraphQL queries; sustained toggling got the session 403'd on 2026-09-18
@@ -271,10 +275,27 @@
         if (!/graphql/i.test(url) || typeof body !== 'string') return;
         let j; try { j = JSON.parse(body); } catch { return; }
         const op = String(j.operationName || '');
-        if (/GetInProgressTripReservationOffers/i.test(op)) { GQL.url = url; GQL.offersBody = body; if (headers) GQL.headers = headers; saveGql(); }
-        else if (/AcceptOpenTripOffer/i.test(op)) { GQL.url = url; GQL.acceptBody = body; if (headers) GQL.headers = headers; saveGql(); }
+        // Learn EVERY offer-list query, not just one. 2026-09-18: only
+        // GetInProgressTripReservationOffers was learned, which lists trips already running
+        // (2 rows) while the acceptable requests live in Open/Unassigned (8 and 19 rows),
+        // so direct mode polled the wrong list and never accepted anything.
+        if (/^Get\w*TripReservationOffers$/i.test(op)) {
+            GQL.url = url;
+            GQL.offerQueries = GQL.offerQueries || {};
+            GQL.offerQueries[op] = body;
+            if (headers) GQL.headers = headers;
+            saveGql();
+        } else if (/AcceptOpenTripOffer/i.test(op)) {
+            GQL.url = url; GQL.acceptBody = body; if (headers) GQL.headers = headers; saveGql();
+        }
     }
-    function gqlReady() { return !!(GQL.url && GQL.offersBody && GQL.acceptBody); }
+    // the lists worth polling for acceptable offers, best first
+    function offerSources() {
+        const want = String(S.DIRECT_SOURCES || '').split(',').map(x => x.trim()).filter(Boolean);
+        const have = GQL.offerQueries || {};
+        return want.filter(nm => have[nm]).map(nm => ({ name: nm, body: have[nm] }));
+    }
+    function gqlReady() { return !!(GQL.url && GQL.acceptBody && offerSources().length); }
 
     function installNetRecorder() {
         if (window.__ufm3NetInstalled) return; window.__ufm3NetInstalled = true;
@@ -420,11 +441,21 @@
         if (inFlight || Date.now() - lastDomAcceptAt < 15000) return;   // a DOM accept is outstanding
         directBusy = true;
         try {
-            const pj = await gqlPost(GQL.offersBody, 5000);
-            if (!running || authBlocked || !S.DIRECT_MODE) return;      // state may have changed across the await
-            if (!pj.ok) { log('offers poll HTTP ' + pj.status); return; }
+            // poll every configured list, newest-first, and merge them by uuid
+            const offers = []; const byUuid = new Set(); let anyOk = false;
+            for (const src of offerSources()) {
+                const pj = await gqlPost(src.body, 5000);
+                if (!running || authBlocked || !S.DIRECT_MODE) return;  // state may have changed across the await
+                if (!pj.ok) { log('offers poll ' + src.name + ' HTTP ' + pj.status); continue; }
+                anyOk = true;
+                for (const o of extractOffers(pj.json)) {
+                    const u = offerUuid(o);
+                    if (!u || byUuid.has(u)) continue;
+                    byUuid.add(u); o.__src = src.name; offers.push(o);
+                }
+            }
+            if (!anyOk) return;
             lastPollOkAt = Date.now();
-            const offers = extractOffers(pj.json);
             directPolls++; directSeen = offers.length;
             for (const o of offers) {
                 const uu = offerUuid(o); if (!uu) continue;
@@ -464,7 +495,7 @@
                     tone(440, 0.3, 0.3);
                     break;
                 }
-                addLog({ id: uu.slice(0, 8), fare, result: cls.label + ' (direct, ' + ms + 'ms)' });
+                addLog({ id: uu.slice(0, 8), fare, result: cls.label + ' (direct via ' + String(o.__src || '?').replace(/^Get|TripReservationOffers$/g, '') + ', ' + ms + 'ms)' });
                 if (cls.kind === 'ok' || cls.kind === 'alreadyAccepted') {
                     playAcceptTone(); notify({ fare, id: uu.slice(0, 8) }, cls.kind === 'ok' ? 'Accepted' : 'Already accepted');
                 } else {
@@ -670,7 +701,7 @@
                 }
             }
         } else {
-            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>${S.DIRECT_MODE ? (gqlReady() ? `DIRECT API · polls: ${directPolls} · offers seen: ${directSeen}` : 'DIRECT API armed · needs 1 normal accept to learn the mutation' + (GQL.offersBody ? ' (offers query: learned)' : ' (offers query: not yet seen)')) : `scans: ${scanCount} · refreshes: ${refreshCount} · held(stale): ${skippedStale}`}`);
+            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>${S.DIRECT_MODE ? (gqlReady() ? `DIRECT API · polls: ${directPolls} · offers: ${directSeen} · lists: ${offerSources().map(x => x.name.replace(/^Get|TripReservationOffers$/g, '')).join('+') || 'none'}` : 'DIRECT API armed · lists learned: ' + Object.keys(GQL.offerQueries || {}).length + (GQL.acceptBody ? '' : ' · needs 1 normal accept to learn the mutation')) : `scans: ${scanCount} · refreshes: ${refreshCount} · held(stale): ${skippedStale}`}`);
         }
     }
 
@@ -980,6 +1011,7 @@
             ${num('ufm3-postref', 'Quiet after refresh (ms)', S.POST_REFRESH_MS, 0)}
             ${chk('ufm3-direct', 'DIRECT API mode (recommended)', S.DIRECT_MODE)}
             ${num('ufm3-dpoll', 'Direct poll every (ms)', S.DIRECT_POLL_MS, 100)}
+            <label>Offer lists to poll<input id="ufm3-dsrc" type="text" value="${S.DIRECT_SOURCES}"></label>
             ${chk('ufm3-refreshon', 'Tab-toggle refresh', S.REFRESH_ON)}
             ${chk('ufm3-sound', 'Sound', S.SOUND_ON)}
             ${chk('ufm3-notify', 'Desktop notification', S.NOTIFY_ON)}
@@ -1008,7 +1040,7 @@
         bind('ufm3-skiptoday', 'SKIP_TODAY', 'bool'); bind('ufm3-pickupon', 'PICKUP_FILTER_ON', 'bool'); bind('ufm3-pfrom', 'PICKUP_FROM', 'text'); bind('ufm3-pto', 'PICKUP_TO', 'text');
         bind('ufm3-scan', 'SCAN_MS'); bind('ufm3-refresh', 'REFRESH_MS'); bind('ufm3-refreshon', 'REFRESH_ON', 'bool');
         bind('ufm3-settle', 'SETTLE_MS'); bind('ufm3-postref', 'POST_REFRESH_MS');
-        bind('ufm3-direct', 'DIRECT_MODE', 'bool'); bind('ufm3-dpoll', 'DIRECT_POLL_MS');
+        bind('ufm3-direct', 'DIRECT_MODE', 'bool'); bind('ufm3-dpoll', 'DIRECT_POLL_MS'); bind('ufm3-dsrc', 'DIRECT_SOURCES', 'text');
         bind('ufm3-sound', 'SOUND_ON', 'bool'); bind('ufm3-notify', 'NOTIFY_ON', 'bool'); bind('ufm3-keep', 'KEEPALIVE_ON', 'bool');
 
         document.getElementById('ufm3-toggle').onclick = () => running ? stop() : start();
