@@ -21,7 +21,7 @@
         AUTO_ACCEPT: true,         // false = alert only (behaves like V2)
         DRY_RUN: false,            // true = highlight + log + beep, but never click Accept (memory-only, does not mark trips handled).
         CITY_FILTER_ON: false,     // optional: only accept if pickup/stop city text matches
-        CITY_LIST: 'Chennai,Pallavaram,Tambaram,Chromepet,Chrompet,Anakaputhur,Ambattur,Avadi,Poonamallee,Porur,Velachery,Adyar,Guindy,Perungudi,Sholinganallur,Thoraipakkam,Pallikaranai,Medavakkam,Madipakkam,Alandur,Perambur,Villivakkam,Madhavaram,Tiruvottiyur,Thiruvottiyur,Anna Nagar,T Nagar,Triplicane,Mylapore,Nungambakkam,Egmore,Kodambakkam,Saidapet,Vadapalani,Ashok Nagar,Besant Nagar,Thiruvanmiyur,Kelambakkam,Siruseri,Navalur',      // comma separated, case-insensitive substring match
+        CITY_LIST: 'Tamil Nadu',      // comma separated, case-insensitive substring match
         PICKUP_FILTER_ON: false,   // only accept if pickup date is inside the window below (IST)
         PICKUP_FROM: '',           // 'YYYY-MM-DD' (IST) or blank = no lower limit
         PICKUP_TO: '',             // 'YYYY-MM-DD' (IST) or blank = no upper limit
@@ -1073,7 +1073,7 @@
             ${chk('ufm3-auto', 'Auto-accept in range', S.AUTO_ACCEPT)}
             ${chk('ufm3-dry', 'DRY RUN (log only, never click)', S.DRY_RUN)}
             ${chk('ufm3-cityon', 'Pickup city filter', S.CITY_FILTER_ON)}
-            <label>Pickup cities (comma separated)<input id="ufm3-city" type="text" value="${S.CITY_LIST}"></label>
+            <label>Pickup match, comma separated (state or city)<input id="ufm3-city" type="text" value="${S.CITY_LIST}"></label>
             ${chk('ufm3-skiptoday', 'Skip today\'s pickups (IST)', S.SKIP_TODAY)}
             ${chk('ufm3-pickupon', 'Pickup date window (IST)', S.PICKUP_FILTER_ON)}
             <label>Pickup from<input id="ufm3-pfrom" type="date" value="${S.PICKUP_FROM}"></label>
