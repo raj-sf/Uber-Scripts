@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.3.0
+// @version      3.3.1
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -32,7 +32,7 @@
         DIRECT_POLL_MS: 400,       // how often to poll the offers query in direct mode
         SCAN_MS: 10,               // scan interval (ms). 10 = ~100 DOM scans/sec; CPU heavy but allowed
         REFRESH_MS: 150,           // tab toggle interval (ms). Warning: <1000 means many list fetches/sec; Uber may throttle ('Fetching unassigned offer failed')
-        REFRESH_ON: true,          // toggle Announcements <-> Trip Management
+        REFRESH_ON: false,         // OFF: each toggle fires ~7 GraphQL queries; sustained toggling got the session 403'd on 2026-09-18
         SOUND_ON: true,
         NOTIFY_ON: true,
         KEEPALIVE_ON: true,        // silent 20 Hz tone so the browser does not throttle this tab
@@ -229,6 +229,7 @@
             try { if (init && init.headers) { hdrs = {}; new Headers(init.headers).forEach((v, k) => { hdrs[k] = v; }); } } catch {}
             try { learnGql(url, hdrs, body); } catch {}
             const res = await origFetch.apply(this, arguments);
+            try { if (!NET_SKIP.test(url)) noteHttpStatus(res.status, url); } catch {}
             if (!NET_SKIP.test(url)) {
                 let text = null;
                 try { text = (await res.clone().text()).slice(0, 3000); } catch {}
@@ -246,6 +247,7 @@
             if (meta && !NET_SKIP.test(meta.url)) {
                 meta.started = Date.now(); meta.reqBody = typeof b === 'string' ? b.slice(0, 4000) : null;
                 this.addEventListener('loadend', () => {
+                    try { noteHttpStatus(this.status, meta.url); } catch {}
                     let text = null; try { text = String(this.responseText || '').slice(0, 3000); } catch {}
                     netSave({ time: new Date().toISOString(), via: 'xhr', method: meta.method, url: meta.url.slice(0, 300), status: this.status, ms: Date.now() - meta.started, reqBody: meta.reqBody, resBody: text });
                 });
@@ -318,8 +320,30 @@
         return true;
     }
 
+    // ---------- auth circuit breaker ----------
+    // 2026-09-18: Uber began returning 403 {"message":"forbidden by authentication server"} on
+    // every query including the page's own. Hammering a blocked session makes it worse, so stop dead.
+    let authBlocked = false, authFailCount = 0, lastAuthFail = 0;
+    function noteHttpStatus(status, url) {
+        if (status === 403 || status === 401) {
+            authFailCount++; lastAuthFail = Date.now();
+            if (!authBlocked && authFailCount >= 3) {
+                authBlocked = true;
+                log('AUTH BLOCKED: ' + status + ' from ' + String(url).slice(0, 60) + ' — stopping all activity');
+                addLog({ id: '-', fare: 0, result: 'AUTH BLOCKED (' + status + ') — session rejected, re-login required' });
+                stop();
+                startBeepLoop();
+                status_('SESSION BLOCKED by Uber (HTTP ' + status + '). Log out, log back in, then press START.');
+            }
+        } else if (status >= 200 && status < 300) {
+            if (Date.now() - lastAuthFail > 30000) authFailCount = 0;   // healthy again
+        }
+    }
+    function status_(m) { const el = document.getElementById('ufm3-status'); if (el) el.innerHTML = '<b style="color:#ff6b6b">' + m + '</b>'; }
+
     let directBusy = false, directPolls = 0, directSeen = 0;
     async function directTick() {
+        if (authBlocked) return;
         if (!running || !S.DIRECT_MODE || directBusy || !gqlReady()) return;
         directBusy = true;
         try {
@@ -525,7 +549,7 @@
 
     let skippedStale = 0;
     function scan() {
-        if (!running) return;
+        if (!running || authBlocked) return;
         scanCount++;
         if (inFlight) { checkInFlight(); return; }
 
@@ -553,7 +577,7 @@
                 }
             }
         } else {
-            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>${S.DIRECT_MODE ? (gqlReady() ? `DIRECT API · polls: ${directPolls} · offers seen: ${directSeen}` : 'DIRECT API: waiting to learn Uber\'s API (open/refresh the list once)') : `scans: ${scanCount} · refreshes: ${refreshCount} · held(stale): ${skippedStale}`}`);
+            if (scanCount % 20 === 0) status(`Scanning… rows: ${seen} · range ₹${S.MIN_FARE}–₹${S.MAX_FARE}${S.DRY_RUN ? ' · DRY RUN' : ''}${S.SKIP_TODAY ? ' · skip today' : ''}${S.PICKUP_FILTER_ON ? ' · pickup ' + (S.PICKUP_FROM || '…') + '→' + (S.PICKUP_TO || '…') : ''}<br>${S.DIRECT_MODE ? (gqlReady() ? `DIRECT API · polls: ${directPolls} · offers seen: ${directSeen}` : 'DIRECT API armed · needs 1 normal accept to learn the mutation' + (GQL.offersBody ? ' (offers query: learned)' : ' (offers query: not yet seen)')) : `scans: ${scanCount} · refreshes: ${refreshCount} · held(stale): ${skippedStale}`}`);
         }
     }
 
@@ -679,7 +703,7 @@
         return null;
     }
     function refreshTick() {
-        if (!running || !S.REFRESH_ON) return;
+        if (!running || !S.REFRESH_ON || authBlocked) return;
         if (inFlight) return;
         if (Date.now() - lastToggle < S.REFRESH_MS) return;
         lastToggle = Date.now(); lastRefreshAt = Date.now();
@@ -914,6 +938,7 @@
     // START / STOP
     // ================================================================
     function start() {
+        authBlocked = false; authFailCount = 0;
         running = true; ensureAudio(); startKeepAlive(); startObserver(); startTimers();
         document.getElementById('ufm3-toggle').textContent = 'STOP';
         document.getElementById('ufm3-toggle').classList.add('on');
