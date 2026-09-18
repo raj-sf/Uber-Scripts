@@ -66,6 +66,52 @@ check('uuid parsed from real accept body',
 check('plain-string uuid variant', acceptUuidFromBody(JSON.stringify({ variables: { offerUuid: 'abc-123' } })), 'abc-123');
 check('garbage body returns null', acceptUuidFromBody('not json'), null);
 
+
+console.log('\n--- pickup-only city filter (v3.6.0) ---');
+const offerPickupText = eval('(' + extract('offerPickupText') + ')');
+// S is a module-level settings object in the userscript; the test supplies its own.
+let S = { CITY_FILTER_ON: true, CITY_LIST: 'Chennai' };
+const pickupCityOk = eval('(' + extract('pickupCityOk') + ')');
+
+// Real shape captured from a live GetOpenTripReservationOffers response, 2026-09-18.
+function offer(pickShort, pickFull, dropShort, dropFull) {
+    return {
+        uuid: 'u-1',
+        fareDetails: { displayFare: '₹3,200.00' },
+        tripRequestLocationDetails: {
+            pickupLocationDetails: { displayAddress: pickFull, displayShortAddress: pickShort },
+            dropoffLocationDetails: { displayAddress: dropFull, displayShortAddress: dropShort }
+        }
+    };
+}
+const blrToMaa = offer('Hotel MVTJ, Post, Bengaluru, 560077', '18,19 & 20, Niranjana, 14th Cross, Bengaluru, Karnataka',
+                       'Chennai, Tamil Nadu, India', 'Chennai International Airport, Chennai, Tamil Nadu, India');
+const maaToBlr = offer('Anna Nagar, Chennai, 600040', 'W Block, 2nd Ave, Anna Nagar, Chennai, Tamil Nadu 600040',
+                       'Bengaluru, Karnataka, India', 'Kempegowda International Airport, Bengaluru');
+const maaToMaa = offer('T Nagar, Chennai, 600017', 'Ranganathan St, T Nagar, Chennai, Tamil Nadu',
+                       'Chennai, Tamil Nadu', 'Marina Beach, Chennai, Tamil Nadu');
+const blrToBlr = offer('Indiranagar, Bengaluru, 560038', '100 Feet Rd, Indiranagar, Bengaluru',
+                       'Whitefield, Bengaluru', 'Whitefield, Bengaluru, Karnataka');
+
+check('pickup text excludes the dropoff', /chennai/i.test(offerPickupText(blrToMaa)), false);
+check('pickup text includes the pickup', /bengaluru/i.test(offerPickupText(blrToMaa)), true);
+
+check('Bengaluru -> Chennai is REJECTED', pickupCityOk(blrToMaa), false);
+check('Chennai -> Bengaluru is ACCEPTED', pickupCityOk(maaToBlr), true);
+check('Chennai -> Chennai is ACCEPTED', pickupCityOk(maaToMaa), true);
+check('Bengaluru -> Bengaluru is REJECTED', pickupCityOk(blrToBlr), false);
+
+S = { CITY_FILTER_ON: false, CITY_LIST: 'Chennai' };
+check('filter off lets Bengaluru through', pickupCityOk(blrToBlr), true);
+S = { CITY_FILTER_ON: true, CITY_LIST: '  chennai , Coimbatore ' };
+check('list is trimmed and case-insensitive', pickupCityOk(maaToBlr), true);
+check('second city in the list matches', pickupCityOk(offer('Gandhipuram, Coimbatore, 641012', 'Cross Cut Rd, Gandhipuram, Coimbatore', 'Chennai', 'Chennai')), true);
+S = { CITY_FILTER_ON: true, CITY_LIST: 'Chennai' };
+check('no pickup details at all fails CLOSED',
+    pickupCityOk({ uuid: 'x', fareDetails: { displayFare: '₹1.00' } }), false);
+check('dropoff-only offer fails CLOSED',
+    pickupCityOk({ uuid: 'x', fareDetails: {}, tripRequestLocationDetails: { dropoffLocationDetails: { displayAddress: 'Chennai, India' } } }), false);
+
 console.log('\n--- shipped-source assertions ---');
 function has(name, re) { const ok = re.test(src); if (!ok) fail++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}`); }
 has('DOM path never reports ACCEPTED from a vanished row', /UNKNOWN \(row gone, no accept seen\)/);
@@ -79,6 +125,9 @@ has('pickup filter fails CLOSED', /fail CLOSED: never accept when the date filte
 has('loss regex no longer matches a bare "failed"', /trip acceptance failed\|no longer available/);
 has('stop\\(\\) drains an in-flight accept', /ABORTED after accept was sent/);
 has('an observed accept retires the offer for both paths', /handled\[uu\] = Date\.now\(\); saveHandled\(\);/);
+has('city filter matches pickup only', /city list matches the PICKUP address only/);
+has('DOM city filter reads the pickup column', /function pickupColIndex\(row\)/);
+has('DOM city filter fails CLOSED', /fail CLOSED: cannot tell pickup from dropoff/);
 has('the 1.5s retry click is gone', /^(?!.*retry click on inner)[\s\S]*$/);
 
 console.log(fail === 0 ? '\nALL TESTS PASS' : `\n${fail} FAILURE(S)`);

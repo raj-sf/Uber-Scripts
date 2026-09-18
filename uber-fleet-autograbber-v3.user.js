@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber Fleet - Auto Grabber V3 (Monitor + Accept, exact fare)
 // @namespace    http://tampermonkey.net/
-// @version      3.5.2
+// @version      3.6.0
 // @description  Scans Trip Management, reads the Fare column exactly, filters by pickup date, auto-accepts trips inside the fare range, confirms only its own dialog, keeps the list fresh by tab toggling, keeps working in background tabs, logs every accept.
 // @match        https://fleethub.uber.com/orgs/*/trip-reservation-offer*
 // @match        https://supplier.uber.com/orgs/*/trip-reservation-offer*
@@ -391,14 +391,48 @@
         const valid = seen.filter(x => Number.isFinite(x));
         return valid.length ? Math.min.apply(null, valid) : null;
     }
+    // ---------- pickup-location text (city filter matches PICKUP ONLY) ----------
+    // Real offer shape (verified live 2026-09-18):
+    //   tripRequestLocationDetails.pickupLocationDetails.displayAddress
+    //   tripRequestLocationDetails.pickupLocationDetails.displayShortAddress
+    // Dropoff lives under .dropoffLocationDetails and must NOT be matched.
+    function offerPickupText(o) {
+        const parts = [];
+        try {
+            const p = o.tripRequestLocationDetails && o.tripRequestLocationDetails.pickupLocationDetails;
+            if (p) {
+                ['displayAddress', 'displayShortAddress', 'addressLine1', 'addressLine2', 'city', 'shortAddress', 'fullAddress', 'name']
+                    .forEach(k => { if (typeof p[k] === 'string' && p[k]) parts.push(p[k]); });
+            }
+        } catch (e) { /* fall through to the generic scan */ }
+        if (!parts.length) {
+            // Defensive fallback: walk any object whose key mentions pickup (but never dropoff/destination)
+            (function walk(x, keyPath) {
+                if (!x || typeof x !== 'object') return;
+                Object.keys(x).forEach(k => {
+                    const v = x[k];
+                    const path = keyPath + '.' + k.toLowerCase();
+                    if (/drop ?off|dropoff|destination/.test(path)) return;
+                    if (typeof v === 'string') {
+                        if (/pick ?up|pickup|origin|source/.test(path) && v.length > 2) parts.push(v);
+                    } else if (v && typeof v === 'object') walk(v, path);
+                });
+            })(o, '');
+        }
+        return parts.join(' | ');
+    }
+    function pickupCityOk(o) {
+        if (!S.CITY_FILTER_ON) return true;
+        const list = String(S.CITY_LIST || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+        if (!list.length) return true;
+        const txt = offerPickupText(o).toLowerCase();
+        if (!txt) return false;                    // fail CLOSED: no pickup text -> do not accept
+        return list.some(c => txt.includes(c));
+    }
     function offerMatches(o) {
         const fare = offerFare(o);
         if (fare === null || fare < S.MIN_FARE || fare > S.MAX_FARE) return false;
-        const blob = JSON.stringify(o).toLowerCase();
-        if (S.CITY_FILTER_ON) {
-            const list = S.CITY_LIST.split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
-            if (list.length && !list.some(c => blob.includes(c))) return false;
-        }
+        if (!pickupCityOk(o)) return false;        // city list matches the PICKUP address only
         if (S.SKIP_TODAY || S.PICKUP_FILTER_ON) {
             const ms = offerPickupMs(o);
             if (ms === null) return false;              // fail CLOSED: never accept when the date filter cannot be evaluated
@@ -626,11 +660,49 @@
         return id || clean(row.textContent).slice(0, 60);
     }
 
+    // Index of the "Pickup address" column, learned from the table header once per scan pass.
+    function pickupColIndex(row) {
+        try {
+            const table = row.closest('table, [role="table"], [role="grid"]');
+            if (!table) return -1;
+            const head = table.querySelector('thead tr, [role="row"]');
+            if (!head) return -1;
+            const cells = head.querySelectorAll('th, td, [role="columnheader"], [role="cell"]');
+            for (let i = 0; i < cells.length; i++) {
+                const h = clean(cells[i].textContent).toLowerCase();
+                if (/pick\s*-?\s*up/.test(h) && /address|location|from/.test(h)) return i;
+            }
+            // "Pickup" alone is the address column only when a separate time column exists
+            for (let i = 0; i < cells.length; i++) {
+                const h = clean(cells[i].textContent).toLowerCase();
+                if (/^pick\s*-?\s*up$/.test(h)) return i;
+            }
+        } catch (e) { /* ignore */ }
+        return -1;
+    }
+
+    // City list matches the PICKUP address only - never the dropoff.
     function cityOk(row) {
         if (!S.CITY_FILTER_ON) return true;
         const list = S.CITY_LIST.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
         if (!list.length) return true;
-        const text = clean(row.textContent).toLowerCase();
+
+        const cells = row.querySelectorAll('td, [role="cell"], [role="gridcell"]');
+        let text = '';
+
+        const idx = pickupColIndex(row);
+        if (idx >= 0 && cells[idx]) text = clean(cells[idx].textContent);
+
+        if (!text) {
+            // Fallback: first address-looking cell in the row is the pickup; the dropoff
+            // is always a later cell, so stop at the first hit.
+            for (let i = 0; i < cells.length; i++) {
+                const t = clean(cells[i].textContent);
+                if (t.length >= 12 && /[A-Za-z]{3}/.test(t) && /,|\b\d{6}\b/.test(t) && !/^\u20b9/.test(t)) { text = t; break; }
+            }
+        }
+        if (!text) return false;                   // fail CLOSED: cannot tell pickup from dropoff
+        text = text.toLowerCase();
         return list.some(c => text.includes(c));
     }
 
@@ -1000,8 +1072,8 @@
             ${num('ufm3-max', 'Maximum fare ₹', S.MAX_FARE)}
             ${chk('ufm3-auto', 'Auto-accept in range', S.AUTO_ACCEPT)}
             ${chk('ufm3-dry', 'DRY RUN (log only, never click)', S.DRY_RUN)}
-            ${chk('ufm3-cityon', 'City filter', S.CITY_FILTER_ON)}
-            <label>Cities (comma separated)<input id="ufm3-city" type="text" value="${S.CITY_LIST}"></label>
+            ${chk('ufm3-cityon', 'Pickup city filter', S.CITY_FILTER_ON)}
+            <label>Pickup cities (comma separated)<input id="ufm3-city" type="text" value="${S.CITY_LIST}"></label>
             ${chk('ufm3-skiptoday', 'Skip today\'s pickups (IST)', S.SKIP_TODAY)}
             ${chk('ufm3-pickupon', 'Pickup date window (IST)', S.PICKUP_FILTER_ON)}
             <label>Pickup from<input id="ufm3-pfrom" type="date" value="${S.PICKUP_FROM}"></label>
